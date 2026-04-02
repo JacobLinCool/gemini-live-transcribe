@@ -78,6 +78,7 @@ jobs:
           fi
 
           gh release create "$TAG_NAME" "${assets[@]}" \
+            --repo "${{ github.repository }}" \
             --verify-tag \
             --title "$TAG_NAME" \
             --generate-notes
