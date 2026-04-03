@@ -25,7 +25,11 @@ fn data_root_dir() -> Option<PathBuf> {
 fn config_root_dir() -> Option<PathBuf> {
     env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(PathBuf::from).map(|home| home.join(".config")))
+        .or_else(|| {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".config"))
+        })
         .map(|dir| dir.join(APP_NAME))
 }
 
