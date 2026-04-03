@@ -93,9 +93,13 @@ fn create_test_env() -> PathsTestEnv {
     std::fs::create_dir_all(&xdg_data_home).expect("xdg data home should be created");
     PathsTestEnv {
         root,
-        config_path: xdg_config_home.join("gemini-live-transcribe").join("config.toml"),
+        config_path: xdg_config_home
+            .join("gemini-live-transcribe")
+            .join("config.toml"),
         logs_dir: xdg_data_home.join("gemini-live-transcribe").join("logs"),
-        transcripts_dir: xdg_data_home.join("gemini-live-transcribe").join("transcripts"),
+        transcripts_dir: xdg_data_home
+            .join("gemini-live-transcribe")
+            .join("transcripts"),
         debug_dir: xdg_data_home.join("gemini-live-transcribe").join("debug"),
         env_pairs: vec![
             ("HOME", home),
