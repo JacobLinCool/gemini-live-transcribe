@@ -86,14 +86,22 @@ fn create_test_env() -> PathsTestEnv {
 fn create_test_env() -> PathsTestEnv {
     let root = create_test_root();
     let home = root.join("home");
+    let xdg_config_home = home.join(".config");
+    let xdg_data_home = home.join(".local").join("share");
     std::fs::create_dir_all(&home).expect("test home should be created");
+    std::fs::create_dir_all(&xdg_config_home).expect("xdg config home should be created");
+    std::fs::create_dir_all(&xdg_data_home).expect("xdg data home should be created");
     PathsTestEnv {
         root,
-        config_path: home.join(".config/gemini-live-transcribe/config.toml"),
-        logs_dir: home.join(".local/share/gemini-live-transcribe/logs"),
-        transcripts_dir: home.join(".local/share/gemini-live-transcribe/transcripts"),
-        debug_dir: home.join(".local/share/gemini-live-transcribe/debug"),
-        env_pairs: vec![("HOME", home)],
+        config_path: xdg_config_home.join("gemini-live-transcribe").join("config.toml"),
+        logs_dir: xdg_data_home.join("gemini-live-transcribe").join("logs"),
+        transcripts_dir: xdg_data_home.join("gemini-live-transcribe").join("transcripts"),
+        debug_dir: xdg_data_home.join("gemini-live-transcribe").join("debug"),
+        env_pairs: vec![
+            ("HOME", home),
+            ("XDG_CONFIG_HOME", xdg_config_home),
+            ("XDG_DATA_HOME", xdg_data_home),
+        ],
     }
 }
 
@@ -101,17 +109,29 @@ fn create_test_env() -> PathsTestEnv {
 fn create_test_env() -> PathsTestEnv {
     let root = create_test_root();
     let user_profile = root.join("home");
-    let appdata = root.join("AppData/Roaming");
-    let local_appdata = root.join("AppData/Local");
+    let appdata = root.join("AppData").join("Roaming");
+    let local_appdata = root.join("AppData").join("Local");
     std::fs::create_dir_all(&user_profile).expect("user profile should be created");
     std::fs::create_dir_all(&appdata).expect("appdata should be created");
     std::fs::create_dir_all(&local_appdata).expect("local appdata should be created");
     PathsTestEnv {
         root,
-        config_path: appdata.join("gemini-live-transcribe/config/config.toml"),
-        logs_dir: local_appdata.join("gemini-live-transcribe/data/logs"),
-        transcripts_dir: local_appdata.join("gemini-live-transcribe/data/transcripts"),
-        debug_dir: local_appdata.join("gemini-live-transcribe/data/debug"),
+        config_path: appdata
+            .join("gemini-live-transcribe")
+            .join("config")
+            .join("config.toml"),
+        logs_dir: local_appdata
+            .join("gemini-live-transcribe")
+            .join("data")
+            .join("logs"),
+        transcripts_dir: local_appdata
+            .join("gemini-live-transcribe")
+            .join("data")
+            .join("transcripts"),
+        debug_dir: local_appdata
+            .join("gemini-live-transcribe")
+            .join("data")
+            .join("debug"),
         env_pairs: vec![
             ("USERPROFILE", user_profile.clone()),
             ("HOME", user_profile),
