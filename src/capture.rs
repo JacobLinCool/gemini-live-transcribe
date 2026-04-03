@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(target_os = "macos")]
+use std::ffi::c_void;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -6,9 +8,24 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(target_os = "macos")]
+use std::{mem::MaybeUninit, ptr::NonNull};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
+#[cfg(target_os = "macos")]
+use coreaudio::audio_unit::audio_format::LinearPcmFlags;
+#[cfg(target_os = "macos")]
+use coreaudio::audio_unit::macos_helpers::{
+    audio_unit_from_device_id, get_default_device_id, get_device_name,
+};
+#[cfg(target_os = "macos")]
+use coreaudio::audio_unit::render_callback::{self, data};
+#[cfg(target_os = "macos")]
+use coreaudio::audio_unit::{
+    AudioUnit, Element, SampleFormat as CoreAudioSampleFormat, Scope,
+    StreamFormat as CoreAudioStreamFormat,
+};
 #[cfg(target_os = "macos")]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 #[cfg(target_os = "macos")]
@@ -16,24 +33,38 @@ use cpal::{
     FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig,
 };
 #[cfg(target_os = "macos")]
-use screencapturekit::cm::CMSampleBuffer;
+use objc2::{AnyThread, rc::Retained};
 #[cfg(target_os = "macos")]
-use screencapturekit::prelude::{
-    SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration, SCStreamOutputType,
+use objc2_core_audio::{
+    AudioDeviceID, AudioHardwareCreateAggregateDevice, AudioHardwareCreateProcessTap,
+    AudioHardwareDestroyAggregateDevice, AudioHardwareDestroyProcessTap,
+    AudioObjectGetPropertyData, AudioObjectID, AudioObjectPropertyAddress, CATapDescription,
+    CATapMuteBehavior, kAudioAggregateDeviceIsPrivateKey, kAudioAggregateDeviceNameKey,
+    kAudioAggregateDeviceTapAutoStartKey, kAudioAggregateDeviceTapListKey,
+    kAudioAggregateDeviceUIDKey, kAudioDevicePropertyDeviceUID, kAudioEndPointDeviceIsPrivateKey,
+    kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal,
+    kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey,
 };
 #[cfg(target_os = "macos")]
-use screencapturekit::stream::configuration::audio::{AudioChannelCount, AudioSampleRate};
+use objc2_core_audio_types::{AudioBuffer, AudioBufferList};
 #[cfg(target_os = "macos")]
-use screencapturekit::stream::delegate_trait::StreamCallbacks;
+use objc2_core_foundation::{
+    CFArray, CFDictionary, CFMutableDictionary, CFRetained, CFString, kCFAllocatorDefault,
+    kCFTypeArrayCallBacks, kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks,
+};
+#[cfg(target_os = "macos")]
+use objc2_foundation::{NSArray, NSNumber, NSString, ns_string};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 
 use crate::ui::AppEvent;
 
 const TARGET_SAMPLE_RATE: u32 = 16_000;
-const TARGET_BATCH_DURATION_MS: u64 = 100;
+const TARGET_BATCH_DURATION_MS: u64 = 40;
 const AUDIO_ACTIVITY_PEAK_THRESHOLD: f32 = 0.02;
 const AUDIO_ACTIVITY_RMS_THRESHOLD: f32 = 0.005;
+#[cfg(target_os = "macos")]
+type SampleDecoder = fn(&[u8], bool) -> f32;
 
 #[derive(Debug, Clone)]
 pub struct AudioChunk {
@@ -162,12 +193,13 @@ fn run_microphone_capture(
         config.sample_format()
     )));
 
-    let pipeline = Arc::new(Mutex::new(MicrophonePipeline::new(
+    let pipeline = Arc::new(Mutex::new(AudioCapturePipeline::new(
         usize::from(config.channels()),
         config.sample_rate(),
         TARGET_SAMPLE_RATE,
     )));
-    let stream = build_microphone_stream(
+    let stream = build_cpal_input_stream(
+        SourceKind::Microphone,
         &device,
         &config,
         Arc::clone(&pipeline),
@@ -191,105 +223,126 @@ fn run_microphone_capture(
 }
 
 #[cfg(target_os = "macos")]
-fn build_microphone_stream(
+fn build_cpal_input_stream(
+    source: SourceKind,
     device: &cpal::Device,
     config: &SupportedStreamConfig,
-    pipeline: Arc<Mutex<MicrophonePipeline>>,
+    pipeline: Arc<Mutex<AudioCapturePipeline>>,
     route: mpsc::UnboundedSender<AudioChunk>,
     ui_tx: std_mpsc::Sender<AppEvent>,
 ) -> Result<Stream> {
     let stream_config: StreamConfig = config.clone().into();
 
     match config.sample_format() {
-        SampleFormat::I8 => build_microphone_stream_typed::<i8>(
+        SampleFormat::I8 => build_cpal_input_stream_typed::<i8>(
+            source,
             device,
             &stream_config,
             Arc::clone(&pipeline),
             route,
             ui_tx,
         ),
-        SampleFormat::I16 => build_microphone_stream_typed::<i16>(
+        SampleFormat::I16 => build_cpal_input_stream_typed::<i16>(
+            source,
             device,
             &stream_config,
             Arc::clone(&pipeline),
             route,
             ui_tx,
         ),
-        SampleFormat::I24 => build_microphone_stream_typed::<cpal::I24>(
+        SampleFormat::I24 => build_cpal_input_stream_typed::<cpal::I24>(
+            source,
             device,
             &stream_config,
             Arc::clone(&pipeline),
             route,
             ui_tx,
         ),
-        SampleFormat::I32 => build_microphone_stream_typed::<i32>(
+        SampleFormat::I32 => build_cpal_input_stream_typed::<i32>(
+            source,
             device,
             &stream_config,
             Arc::clone(&pipeline),
             route,
             ui_tx,
         ),
-        SampleFormat::I64 => build_microphone_stream_typed::<i64>(
+        SampleFormat::I64 => build_cpal_input_stream_typed::<i64>(
+            source,
             device,
             &stream_config,
             Arc::clone(&pipeline),
             route,
             ui_tx,
         ),
-        SampleFormat::U8 => build_microphone_stream_typed::<u8>(
+        SampleFormat::U8 => build_cpal_input_stream_typed::<u8>(
+            source,
             device,
             &stream_config,
             Arc::clone(&pipeline),
             route,
             ui_tx,
         ),
-        SampleFormat::U16 => build_microphone_stream_typed::<u16>(
+        SampleFormat::U16 => build_cpal_input_stream_typed::<u16>(
+            source,
             device,
             &stream_config,
             Arc::clone(&pipeline),
             route,
             ui_tx,
         ),
-        SampleFormat::U24 => build_microphone_stream_typed::<cpal::U24>(
+        SampleFormat::U24 => build_cpal_input_stream_typed::<cpal::U24>(
+            source,
             device,
             &stream_config,
             Arc::clone(&pipeline),
             route,
             ui_tx,
         ),
-        SampleFormat::U32 => build_microphone_stream_typed::<u32>(
+        SampleFormat::U32 => build_cpal_input_stream_typed::<u32>(
+            source,
             device,
             &stream_config,
             Arc::clone(&pipeline),
             route,
             ui_tx,
         ),
-        SampleFormat::U64 => build_microphone_stream_typed::<u64>(
+        SampleFormat::U64 => build_cpal_input_stream_typed::<u64>(
+            source,
             device,
             &stream_config,
             Arc::clone(&pipeline),
             route,
             ui_tx,
         ),
-        SampleFormat::F32 => build_microphone_stream_typed::<f32>(
+        SampleFormat::F32 => build_cpal_input_stream_typed::<f32>(
+            source,
             device,
             &stream_config,
             Arc::clone(&pipeline),
             route,
             ui_tx,
         ),
-        SampleFormat::F64 => {
-            build_microphone_stream_typed::<f64>(device, &stream_config, pipeline, route, ui_tx)
-        }
-        unsupported => bail!("unsupported microphone sample format: {unsupported}"),
+        SampleFormat::F64 => build_cpal_input_stream_typed::<f64>(
+            source,
+            device,
+            &stream_config,
+            pipeline,
+            route,
+            ui_tx,
+        ),
+        unsupported => bail!(
+            "unsupported {} sample format: {unsupported}",
+            source.title()
+        ),
     }
 }
 
 #[cfg(target_os = "macos")]
-fn build_microphone_stream_typed<T>(
+fn build_cpal_input_stream_typed<T>(
+    source: SourceKind,
     device: &cpal::Device,
     config: &StreamConfig,
-    pipeline: Arc<Mutex<MicrophonePipeline>>,
+    pipeline: Arc<Mutex<AudioCapturePipeline>>,
     route: mpsc::UnboundedSender<AudioChunk>,
     ui_tx: std_mpsc::Sender<AppEvent>,
 ) -> Result<Stream>
@@ -312,8 +365,8 @@ where
         },
         move |error| {
             let _ = ui_tx.send(AppEvent::SourceError {
-                source: SourceKind::Microphone,
-                error: format!("microphone stream error: {error}"),
+                source,
+                error: format!("{} stream error: {error}", source.title()),
             });
         },
         None,
@@ -328,62 +381,36 @@ fn run_system_audio_capture(
     ui_tx: std_mpsc::Sender<AppEvent>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let content = SCShareableContent::get().context(
-        "load shareable content; macOS may require Screen Recording permission for Terminal",
-    )?;
+    let output_device_id = get_default_device_id(false)
+        .context("no default output device available for system audio capture")?;
+    let output_device_name =
+        get_device_name(output_device_id).unwrap_or_else(|_| "unknown".to_string());
 
-    let displays = content.displays();
-    let display = displays
-        .iter()
-        .max_by_key(|display| u64::from(display.width()) * u64::from(display.height()))
-        .context("no display available for system audio capture")?;
-
-    let filter = SCContentFilter::create()
-        .with_display(display)
-        .with_excluding_windows(&[])
-        .build();
-
-    let delegate_tx = ui_tx.clone();
-    let delegate = StreamCallbacks::new()
-        .on_error(move |error| {
-            let _ = delegate_tx.send(AppEvent::Notice(format!("capture error: {error}")));
-        })
-        .on_stop({
-            let delegate_tx = ui_tx.clone();
-            move |error| {
-                let message = error.unwrap_or_else(|| "capture stopped".into());
-                let _ = delegate_tx.send(AppEvent::Notice(message));
-            }
-        });
-
-    let config = SCStreamConfiguration::new()
-        .with_width(display.width())
-        .with_height(display.height())
-        .with_captures_audio(true)
-        .with_sample_rate(AudioSampleRate::Rate16000)
-        .with_channel_count(AudioChannelCount::Mono)
-        .with_excludes_current_process_audio(true);
-
-    let mut stream = SCStream::new_with_delegate(&filter, &config, delegate);
-    let batcher = Arc::new(Mutex::new(AudioChunkBatcher::new(
+    let mut session = SystemAudioCaptureSession::new(output_device_id)
+        .context("create Core Audio system audio tap")?;
+    let stream_format = *session.stream_format();
+    let pipeline = Arc::new(Mutex::new(AudioCapturePipeline::new(
+        stream_format.channels as usize,
+        stream_format.sample_rate.round() as u32,
         TARGET_SAMPLE_RATE,
-        Duration::from_millis(TARGET_BATCH_DURATION_MS),
     )));
 
-    attach_system_audio_handler(
-        &mut stream,
-        Arc::clone(&batcher),
-        route.clone(),
-        ui_tx.clone(),
-    );
+    session
+        .attach_callback(Arc::clone(&pipeline), route.clone(), ui_tx.clone())
+        .context("attach Core Audio tap callback")?;
+
+    let _ = ui_tx.send(AppEvent::Notice(format!(
+        "system output: {output_device_name} | {:.0} Hz | {} ch | {:?}",
+        stream_format.sample_rate, stream_format.channels, stream_format.sample_format
+    )));
 
     let _ = ui_tx.send(AppEvent::Notice(
-        "system audio capture may ask for Screen Recording permission on first run".into(),
+        "system audio capture may ask for System Audio Recording permission on first run".into(),
     ));
 
-    stream
-        .start_capture()
-        .context("start ScreenCaptureKit system audio capture")?;
+    session
+        .start()
+        .context("start Core Audio system audio capture")?;
 
     let _ = ui_tx.send(AppEvent::SourceStatus {
         source: SourceKind::SystemAudio,
@@ -394,45 +421,348 @@ fn run_system_audio_capture(
         thread::sleep(Duration::from_millis(100));
     }
 
-    stream
-        .stop_capture()
-        .context("stop ScreenCaptureKit system audio capture")?;
-    flush_batched_audio(&batcher, &route);
+    session
+        .stop()
+        .context("stop Core Audio system audio capture")?;
+    flush_batched_audio(&pipeline, &route);
 
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn attach_system_audio_handler(
-    stream: &mut SCStream,
-    batcher: Arc<Mutex<AudioChunkBatcher>>,
-    route: mpsc::UnboundedSender<AudioChunk>,
-    ui_tx: std_mpsc::Sender<AppEvent>,
-) {
-    let error_sent = Arc::new(AtomicBool::new(false));
+struct SystemAudioCaptureSession {
+    audio_unit: AudioUnit,
+    _resources: SystemAudioTapResources,
+    stream_format: CoreAudioStreamFormat,
+}
 
-    stream.add_output_handler(
-        move |sample, _type| match decode_audio_samples(&sample) {
-            Ok(samples) if !samples.is_empty() => {
-                let Ok(mut batcher) = batcher.lock() else {
-                    return;
-                };
-                for chunk in batcher.push(&samples, Instant::now()) {
-                    let _ = route.send(chunk);
+#[cfg(target_os = "macos")]
+impl SystemAudioCaptureSession {
+    fn new(output_device_id: AudioDeviceID) -> Result<Self> {
+        let device_uid = get_output_device_uid(output_device_id)?;
+        let tap_description = build_tap_description(&device_uid);
+        let tap_id = create_process_tap(&tap_description)?;
+        let tap_uid = unsafe { tap_description.UUID().UUIDString() };
+        let aggregate_device_id = create_aggregate_device(&tap_uid)?;
+        let resources = SystemAudioTapResources {
+            tap_id: Some(tap_id),
+            aggregate_device_id: Some(aggregate_device_id),
+        };
+
+        let mut audio_unit = audio_unit_from_device_id(
+            resources
+                .aggregate_device_id
+                .expect("aggregate device id should exist"),
+            true,
+        )
+        .context("create Core Audio input unit for system audio tap")?;
+        let native_stream_format = audio_unit
+            .input_stream_format()
+            .context("read native Core Audio tap stream format")?;
+        let desired_stream_format = configured_system_audio_stream_format(native_stream_format);
+        audio_unit
+            .set_stream_format(desired_stream_format, Scope::Output, Element::Input)
+            .context("configure Core Audio system audio stream format")?;
+        let stream_format = audio_unit
+            .input_stream_format()
+            .context("read configured Core Audio tap stream format")?;
+
+        Ok(Self {
+            audio_unit,
+            _resources: resources,
+            stream_format,
+        })
+    }
+
+    fn stream_format(&self) -> &CoreAudioStreamFormat {
+        &self.stream_format
+    }
+
+    fn attach_callback(
+        &mut self,
+        pipeline: Arc<Mutex<AudioCapturePipeline>>,
+        route: mpsc::UnboundedSender<AudioChunk>,
+        ui_tx: std_mpsc::Sender<AppEvent>,
+    ) -> Result<()> {
+        let stream_format = self.stream_format;
+        let error_sent = Arc::new(AtomicBool::new(false));
+
+        self.audio_unit
+            .set_input_callback::<_, data::Raw>(move |args: render_callback::Args<data::Raw>| {
+                match decode_core_audio_samples(args.data.data, stream_format) {
+                    Ok(samples) if !samples.is_empty() => {
+                        let Ok(mut pipeline) = pipeline.lock() else {
+                            return Err(());
+                        };
+                        for chunk in pipeline.push(&samples, Instant::now()) {
+                            let _ = route.send(chunk);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        if !error_sent.swap(true, Ordering::Relaxed) {
+                            let _ = ui_tx.send(AppEvent::SourceError {
+                                source: SourceKind::SystemAudio,
+                                error: format!("system audio decode failed: {error:#}"),
+                            });
+                        }
+                    }
                 }
-            }
-            Ok(_) => {}
-            Err(error) => {
-                if !error_sent.swap(true, Ordering::Relaxed) {
-                    let _ = ui_tx.send(AppEvent::SourceError {
-                        source: SourceKind::SystemAudio,
-                        error: format!("decode failed: {error:#}"),
-                    });
-                }
-            }
+                Ok(())
+            })
+            .context("register Core Audio system audio callback")
+    }
+
+    fn start(&mut self) -> Result<()> {
+        self.audio_unit
+            .start()
+            .context("start Core Audio input unit for system audio")
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        self.audio_unit
+            .stop()
+            .context("stop Core Audio input unit for system audio")
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn configured_system_audio_stream_format(
+    native_stream_format: CoreAudioStreamFormat,
+) -> CoreAudioStreamFormat {
+    CoreAudioStreamFormat {
+        sample_rate: native_stream_format.sample_rate,
+        sample_format: CoreAudioSampleFormat::F32,
+        flags: LinearPcmFlags::IS_FLOAT | LinearPcmFlags::IS_PACKED,
+        channels: native_stream_format.channels.max(1),
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for SystemAudioCaptureSession {
+    fn drop(&mut self) {
+        let _ = self.audio_unit.stop();
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+struct SystemAudioTapResources {
+    tap_id: Option<AudioObjectID>,
+    aggregate_device_id: Option<AudioObjectID>,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for SystemAudioTapResources {
+    fn drop(&mut self) {
+        if let Some(aggregate_device_id) = self.aggregate_device_id.take() {
+            let _ = unsafe { AudioHardwareDestroyAggregateDevice(aggregate_device_id) };
+        }
+        if let Some(tap_id) = self.tap_id.take() {
+            let _ = unsafe { AudioHardwareDestroyProcessTap(tap_id) };
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn get_output_device_uid(output_device_id: AudioDeviceID) -> Result<Retained<NSString>> {
+    let mut device_uid_ptr: *mut NSString = std::ptr::null_mut();
+    let mut data_size = std::mem::size_of::<*mut NSString>() as u32;
+    let property = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyDeviceUID,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+
+    check_core_audio_status(
+        unsafe {
+            AudioObjectGetPropertyData(
+                output_device_id,
+                NonNull::from(&property),
+                0,
+                std::ptr::null(),
+                NonNull::from(&mut data_size),
+                NonNull::from(&mut device_uid_ptr).cast(),
+            )
         },
-        SCStreamOutputType::Audio,
-    );
+        "read default output device uid",
+    )?;
+
+    if device_uid_ptr.is_null() {
+        bail!("default output device uid is null");
+    }
+
+    let device_uid =
+        unsafe { Retained::retain(device_uid_ptr) }.context("retain default output device uid")?;
+    Ok(device_uid)
+}
+
+#[cfg(target_os = "macos")]
+fn build_tap_description(device_uid: &NSString) -> Retained<CATapDescription> {
+    let processes = NSArray::<NSNumber>::new();
+    let tap_description = unsafe {
+        CATapDescription::initWithProcesses_andDeviceUID_withStream(
+            CATapDescription::alloc(),
+            processes.as_ref(),
+            device_uid,
+            0,
+        )
+    };
+    unsafe {
+        tap_description.setMuteBehavior(CATapMuteBehavior::Unmuted);
+        tap_description.setName(ns_string!("gemini-live-transcribe system audio"));
+        tap_description.setPrivate(true);
+        tap_description.setExclusive(true);
+        tap_description.setMixdown(true);
+        tap_description.setMono(true);
+    }
+    tap_description
+}
+
+#[cfg(target_os = "macos")]
+fn create_process_tap(tap_description: &CATapDescription) -> Result<AudioObjectID> {
+    let mut tap_id = MaybeUninit::<AudioObjectID>::uninit();
+    check_core_audio_status(
+        unsafe { AudioHardwareCreateProcessTap(Some(tap_description), tap_id.as_mut_ptr()) },
+        "create system audio process tap",
+    )?;
+    Ok(unsafe { tap_id.assume_init() })
+}
+
+#[cfg(target_os = "macos")]
+fn create_aggregate_device(tap_uid: &NSString) -> Result<AudioObjectID> {
+    let aggregate_properties = create_audio_aggregate_device_properties(tap_uid);
+    let mut aggregate_device_id: AudioObjectID = 0;
+    check_core_audio_status(
+        unsafe {
+            AudioHardwareCreateAggregateDevice(
+                aggregate_properties.as_ref(),
+                NonNull::from(&mut aggregate_device_id),
+            )
+        },
+        "create private aggregate device for system audio tap",
+    )?;
+    Ok(aggregate_device_id)
+}
+
+#[cfg(target_os = "macos")]
+fn create_audio_aggregate_device_properties(tap_uid: &NSString) -> CFRetained<CFDictionary> {
+    let tap_dictionary = unsafe {
+        let dictionary = CFMutableDictionary::new(
+            kCFAllocatorDefault,
+            2,
+            &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks,
+        )
+        .expect("Core Foundation tap dictionary allocation should succeed");
+
+        CFMutableDictionary::set_value(
+            Some(dictionary.as_ref()),
+            &*CFString::from_str(kAudioSubTapUIDKey.to_str().expect("valid sub-tap uid key"))
+                as *const _ as *const c_void,
+            tap_uid as *const _ as *const c_void,
+        );
+        CFMutableDictionary::set_value(
+            Some(dictionary.as_ref()),
+            &*CFString::from_str(
+                kAudioSubTapDriftCompensationKey
+                    .to_str()
+                    .expect("valid drift compensation key"),
+            ) as *const _ as *const c_void,
+            &*NSNumber::initWithBool(NSNumber::alloc(), true) as *const _ as *const c_void,
+        );
+
+        dictionary
+    };
+
+    let tap_list = [tap_dictionary];
+    let taps = unsafe {
+        CFArray::new(
+            kCFAllocatorDefault,
+            tap_list.as_ptr() as *mut *const c_void,
+            tap_list.len() as _,
+            &kCFTypeArrayCallBacks,
+        )
+        .expect("Core Foundation tap array allocation should succeed")
+    };
+
+    let aggregate_name = CFString::from_str("gemini-live-transcribe system audio");
+    let aggregate_uid = CFString::from_str(&format!(
+        "com.jacoblincool.gemini-live-transcribe.system-audio.{}",
+        std::process::id()
+    ));
+
+    unsafe {
+        let dictionary = CFMutableDictionary::new(
+            kCFAllocatorDefault,
+            5,
+            &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks,
+        )
+        .expect("Core Foundation aggregate device allocation should succeed");
+
+        CFMutableDictionary::set_value(
+            Some(dictionary.as_ref()),
+            &*CFString::from_str(
+                kAudioAggregateDeviceNameKey
+                    .to_str()
+                    .expect("valid aggregate name key"),
+            ) as *const _ as *const c_void,
+            &*aggregate_name as *const _ as *const c_void,
+        );
+        CFMutableDictionary::set_value(
+            Some(dictionary.as_ref()),
+            &*CFString::from_str(
+                kAudioAggregateDeviceUIDKey
+                    .to_str()
+                    .expect("valid aggregate uid key"),
+            ) as *const _ as *const c_void,
+            &*aggregate_uid as *const _ as *const c_void,
+        );
+        CFMutableDictionary::set_value(
+            Some(dictionary.as_ref()),
+            &*CFString::from_str(
+                kAudioAggregateDeviceTapListKey
+                    .to_str()
+                    .expect("valid aggregate tap list key"),
+            ) as *const _ as *const c_void,
+            &*taps as *const _ as *const c_void,
+        );
+        CFMutableDictionary::set_value(
+            Some(dictionary.as_ref()),
+            &*CFString::from_str(
+                kAudioAggregateDeviceTapAutoStartKey
+                    .to_str()
+                    .expect("valid aggregate tap auto-start key"),
+            ) as *const _ as *const c_void,
+            &*NSNumber::initWithBool(NSNumber::alloc(), false) as *const _ as *const c_void,
+        );
+        CFMutableDictionary::set_value(
+            Some(dictionary.as_ref()),
+            &*CFString::from_str(
+                kAudioAggregateDeviceIsPrivateKey
+                    .to_str()
+                    .expect("valid aggregate private key"),
+            ) as *const _ as *const c_void,
+            &*NSNumber::initWithBool(NSNumber::alloc(), true) as *const _ as *const c_void,
+        );
+        CFMutableDictionary::set_value(
+            Some(dictionary.as_ref()),
+            &*CFString::from_str(
+                kAudioEndPointDeviceIsPrivateKey
+                    .to_str()
+                    .expect("valid endpoint private key"),
+            ) as *const _ as *const c_void,
+            &*NSNumber::initWithBool(NSNumber::alloc(), true) as *const _ as *const c_void,
+        );
+
+        CFRetained::cast_unchecked::<CFDictionary>(dictionary)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn check_core_audio_status(status: i32, context: &'static str) -> Result<()> {
+    coreaudio::Error::from_os_status(status).with_context(|| context.to_string())
 }
 
 #[cfg(target_os = "macos")]
@@ -450,151 +780,150 @@ where
 }
 
 #[cfg(target_os = "macos")]
-fn decode_audio_samples(sample: &CMSampleBuffer) -> Result<Vec<f32>> {
-    let format = sample
-        .format_description()
-        .context("missing audio format description")?;
-    let channel_count = format
-        .audio_channel_count()
-        .context("missing audio channel count")? as usize;
-    let bits_per_channel = format
-        .audio_bits_per_channel()
-        .context("missing audio bit depth")? as usize;
-    let big_endian = format.audio_is_big_endian();
-    let frame_count = sample.num_samples();
-
-    let buffers = sample
-        .audio_buffer_list()
-        .context("missing audio buffer list")?;
-
-    if frame_count == 0 || buffers.num_buffers() == 0 {
+fn decode_core_audio_samples(
+    buffers: *mut AudioBufferList,
+    format: CoreAudioStreamFormat,
+) -> Result<Vec<f32>> {
+    if buffers.is_null() {
+        return Ok(Vec::new());
+    }
+    let buffer_count = unsafe { (*buffers).mNumberBuffers as usize };
+    if buffer_count == 0 {
         return Ok(Vec::new());
     }
 
-    match (format.audio_is_float(), bits_per_channel) {
-        (true, 32) => decode_f32_buffers(&buffers, channel_count, frame_count, big_endian),
-        (false, 16) => decode_i16_buffers(&buffers, channel_count, frame_count, big_endian),
-        (false, 32) => decode_i32_buffers(&buffers, channel_count, frame_count, big_endian),
-        (is_float, bits) => bail!(
-            "unsupported sample format: float={is_float}, bits={bits}, channels={channel_count}, buffers={}",
-            buffers.num_buffers()
-        ),
+    let channel_count = format.channels as usize;
+    let interleaved = !format.flags.contains(LinearPcmFlags::IS_NON_INTERLEAVED);
+    let packed = format.flags.contains(LinearPcmFlags::IS_PACKED);
+    let big_endian = format.flags.contains(LinearPcmFlags::IS_BIG_ENDIAN);
+
+    let (bytes_per_sample, decode_sample): (usize, SampleDecoder) = match format.sample_format {
+        coreaudio::audio_unit::SampleFormat::F32 => (4, decode_f32_sample),
+        coreaudio::audio_unit::SampleFormat::I32 => (4, decode_i32_sample),
+        coreaudio::audio_unit::SampleFormat::I16 => (2, decode_i16_sample),
+        coreaudio::audio_unit::SampleFormat::I8 => (1, decode_i8_sample),
+        coreaudio::audio_unit::SampleFormat::I24 if packed => (3, decode_i24_sample),
+        coreaudio::audio_unit::SampleFormat::I24 => {
+            bail!("unsupported system audio sample layout: unpacked 24-bit PCM")
+        }
+    };
+
+    if interleaved {
+        return unsafe {
+            decode_interleaved_core_audio_samples(
+                &(*buffers).mBuffers[0],
+                channel_count,
+                bytes_per_sample,
+                big_endian,
+                decode_sample,
+            )
+        };
+    }
+
+    unsafe {
+        decode_planar_core_audio_samples(
+            buffers,
+            channel_count,
+            bytes_per_sample,
+            big_endian,
+            decode_sample,
+        )
     }
 }
 
 #[cfg(target_os = "macos")]
-fn decode_f32_buffers(
-    buffers: &screencapturekit::cm::AudioBufferList,
+unsafe fn decode_interleaved_core_audio_samples(
+    buffer: &AudioBuffer,
     channel_count: usize,
-    frame_count: usize,
-    big_endian: bool,
-) -> Result<Vec<f32>> {
-    decode_buffers(buffers, channel_count, frame_count, 4, move |bytes| {
-        let raw = if big_endian {
-            f32::from_be_bytes(bytes.try_into().unwrap())
-        } else {
-            f32::from_le_bytes(bytes.try_into().unwrap())
-        };
-        raw.clamp(-1.0, 1.0)
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn decode_i16_buffers(
-    buffers: &screencapturekit::cm::AudioBufferList,
-    channel_count: usize,
-    frame_count: usize,
-    big_endian: bool,
-) -> Result<Vec<f32>> {
-    decode_buffers(buffers, channel_count, frame_count, 2, move |bytes| {
-        let raw = if big_endian {
-            i16::from_be_bytes(bytes.try_into().unwrap())
-        } else {
-            i16::from_le_bytes(bytes.try_into().unwrap())
-        };
-        f32::from(raw) / 32768.0
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn decode_i32_buffers(
-    buffers: &screencapturekit::cm::AudioBufferList,
-    channel_count: usize,
-    frame_count: usize,
-    big_endian: bool,
-) -> Result<Vec<f32>> {
-    decode_buffers(buffers, channel_count, frame_count, 4, move |bytes| {
-        let raw = if big_endian {
-            i32::from_be_bytes(bytes.try_into().unwrap())
-        } else {
-            i32::from_le_bytes(bytes.try_into().unwrap())
-        };
-        (raw as f64 / i32::MAX as f64) as f32
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn decode_buffers(
-    buffers: &screencapturekit::cm::AudioBufferList,
-    channel_count: usize,
-    frame_count: usize,
     bytes_per_sample: usize,
-    decode_sample: impl Fn(&[u8]) -> f32,
+    big_endian: bool,
+    decode_sample: fn(&[u8], bool) -> f32,
 ) -> Result<Vec<f32>> {
-    if buffers.num_buffers() == 1 {
-        let buffer = buffers
-            .get(0)
-            .ok_or_else(|| anyhow!("missing interleaved audio buffer"))?;
-        let data = buffer.data();
-        let expected = frame_count
-            .checked_mul(channel_count)
-            .and_then(|value| value.checked_mul(bytes_per_sample))
-            .context("interleaved buffer size overflow")?;
-
-        if data.len() < expected {
-            bail!(
-                "interleaved audio buffer too small: expected at least {expected} bytes, got {}",
-                data.len()
-            );
-        }
-
-        let mut mono = Vec::with_capacity(frame_count);
-        for frame in 0..frame_count {
-            let mut sum = 0.0f32;
-            for channel in 0..channel_count {
-                let offset = (frame * channel_count + channel) * bytes_per_sample;
-                sum += decode_sample(&data[offset..offset + bytes_per_sample]);
-            }
-            mono.push(sum / channel_count as f32);
-        }
-        return Ok(mono);
+    if buffer.mData.is_null() || channel_count == 0 {
+        return Ok(Vec::new());
     }
-
-    if buffers.num_buffers() != channel_count {
+    if buffer.mNumberChannels as usize != channel_count {
         bail!(
-            "unexpected planar audio layout: {} buffers for {channel_count} channels",
-            buffers.num_buffers()
+            "system audio channel mismatch: format expects {channel_count}, buffer reported {}",
+            buffer.mNumberChannels
         );
     }
 
+    let data_len = buffer.mDataByteSize as usize;
+    let frame_width = channel_count
+        .checked_mul(bytes_per_sample)
+        .context("system audio frame width overflow")?;
+    if frame_width == 0 || !data_len.is_multiple_of(frame_width) {
+        bail!("invalid interleaved system audio buffer size: {data_len}");
+    }
+
+    let frame_count = data_len / frame_width;
+    let data = unsafe { std::slice::from_raw_parts(buffer.mData.cast::<u8>(), data_len) };
+    let mut mono = Vec::with_capacity(frame_count);
+
+    for frame in 0..frame_count {
+        let mut sum = 0.0f32;
+        for channel in 0..channel_count {
+            let offset = (frame * channel_count + channel) * bytes_per_sample;
+            sum += decode_sample(&data[offset..offset + bytes_per_sample], big_endian);
+        }
+        mono.push(sum / channel_count as f32);
+    }
+
+    Ok(mono)
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn decode_planar_core_audio_samples(
+    buffers: *mut AudioBufferList,
+    channel_count: usize,
+    bytes_per_sample: usize,
+    big_endian: bool,
+    decode_sample: fn(&[u8], bool) -> f32,
+) -> Result<Vec<f32>> {
+    if channel_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let audio_buffers = unsafe {
+        std::slice::from_raw_parts(
+            (*buffers).mBuffers.as_ptr(),
+            (*buffers).mNumberBuffers as usize,
+        )
+    };
+    if audio_buffers.len() != channel_count {
+        bail!(
+            "unexpected planar system audio layout: {} buffers for {channel_count} channels",
+            audio_buffers.len()
+        );
+    }
+
+    let frame_count = audio_buffers
+        .first()
+        .map(|buffer| buffer.mDataByteSize as usize / bytes_per_sample)
+        .unwrap_or(0);
     let mut mono = vec![0.0f32; frame_count];
 
-    for buffer in buffers {
-        let data = buffer.data();
-        let expected = frame_count
-            .checked_mul(bytes_per_sample)
-            .context("planar buffer size overflow")?;
-
-        if data.len() < expected {
+    for buffer in audio_buffers {
+        if buffer.mData.is_null() {
+            return Ok(Vec::new());
+        }
+        if buffer.mNumberChannels != 1 {
             bail!(
-                "planar audio buffer too small: expected at least {expected} bytes, got {}",
-                data.len()
+                "unexpected planar system audio channel count in buffer: {}",
+                buffer.mNumberChannels
             );
         }
 
+        let data_len = buffer.mDataByteSize as usize;
+        if data_len != frame_count * bytes_per_sample {
+            bail!("mismatched planar system audio buffer size: {data_len}");
+        }
+
+        let data = unsafe { std::slice::from_raw_parts(buffer.mData.cast::<u8>(), data_len) };
         for (frame, sample) in mono.iter_mut().enumerate() {
             let offset = frame * bytes_per_sample;
-            *sample += decode_sample(&data[offset..offset + bytes_per_sample]);
+            *sample += decode_sample(&data[offset..offset + bytes_per_sample], big_endian);
         }
     }
 
@@ -606,17 +935,69 @@ fn decode_buffers(
 }
 
 #[cfg(target_os = "macos")]
+fn decode_f32_sample(bytes: &[u8], big_endian: bool) -> f32 {
+    let raw = if big_endian {
+        f32::from_be_bytes(bytes.try_into().expect("f32 sample width"))
+    } else {
+        f32::from_le_bytes(bytes.try_into().expect("f32 sample width"))
+    };
+    raw.clamp(-1.0, 1.0)
+}
+
+#[cfg(target_os = "macos")]
+fn decode_i32_sample(bytes: &[u8], big_endian: bool) -> f32 {
+    let raw = if big_endian {
+        i32::from_be_bytes(bytes.try_into().expect("i32 sample width"))
+    } else {
+        i32::from_le_bytes(bytes.try_into().expect("i32 sample width"))
+    };
+    (raw as f64 / i32::MAX as f64) as f32
+}
+
+#[cfg(target_os = "macos")]
+fn decode_i24_sample(bytes: &[u8], big_endian: bool) -> f32 {
+    let extended = if big_endian {
+        let sign = if bytes[0] & 0x80 != 0 { 0xFF } else { 0x00 };
+        [sign, bytes[0], bytes[1], bytes[2]]
+    } else {
+        let sign = if bytes[2] & 0x80 != 0 { 0xFF } else { 0x00 };
+        [bytes[0], bytes[1], bytes[2], sign]
+    };
+    let raw = if big_endian {
+        i32::from_be_bytes(extended)
+    } else {
+        i32::from_le_bytes(extended)
+    };
+    (raw as f64 / 8_388_608.0) as f32
+}
+
+#[cfg(target_os = "macos")]
+fn decode_i16_sample(bytes: &[u8], big_endian: bool) -> f32 {
+    let raw = if big_endian {
+        i16::from_be_bytes(bytes.try_into().expect("i16 sample width"))
+    } else {
+        i16::from_le_bytes(bytes.try_into().expect("i16 sample width"))
+    };
+    f32::from(raw) / 32768.0
+}
+
+#[cfg(target_os = "macos")]
+fn decode_i8_sample(bytes: &[u8], _big_endian: bool) -> f32 {
+    bytes[0] as i8 as f32 / 128.0
+}
+
+#[cfg(target_os = "macos")]
 #[derive(Debug)]
-struct MicrophonePipeline {
-    converter: MicrophoneConverter,
+struct AudioCapturePipeline {
+    converter: AudioConverter,
     batcher: AudioChunkBatcher,
 }
 
 #[cfg(target_os = "macos")]
-impl MicrophonePipeline {
+impl AudioCapturePipeline {
     fn new(channels: usize, source_sample_rate: u32, target_sample_rate: u32) -> Self {
         Self {
-            converter: MicrophoneConverter::new(channels, source_sample_rate, target_sample_rate),
+            converter: AudioConverter::new(channels, source_sample_rate, target_sample_rate),
             batcher: AudioChunkBatcher::new(
                 target_sample_rate,
                 Duration::from_millis(TARGET_BATCH_DURATION_MS),
@@ -630,6 +1011,11 @@ impl MicrophonePipeline {
         f32: FromSample<T>,
     {
         let converted = self.converter.push_samples::<T>(data);
+        self.batcher.push(&converted, received_at)
+    }
+
+    fn push(&mut self, data: &[f32], received_at: Instant) -> Vec<AudioChunk> {
+        let converted = self.converter.push_samples::<f32>(data);
         self.batcher.push(&converted, received_at)
     }
 }
@@ -726,7 +1112,7 @@ impl AudioBatching for AudioChunkBatcher {
 }
 
 #[cfg(target_os = "macos")]
-impl AudioBatching for MicrophonePipeline {
+impl AudioBatching for AudioCapturePipeline {
     fn flush_audio(&mut self) -> Option<AudioChunk> {
         self.batcher.flush_audio()
     }
@@ -734,14 +1120,14 @@ impl AudioBatching for MicrophonePipeline {
 
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
-struct MicrophoneConverter {
+struct AudioConverter {
     channels: usize,
     passthrough: bool,
     resampler: LinearResampler,
 }
 
 #[cfg(target_os = "macos")]
-impl MicrophoneConverter {
+impl AudioConverter {
     fn new(channels: usize, source_sample_rate: u32, target_sample_rate: u32) -> Self {
         Self {
             channels: channels.max(1),
@@ -859,7 +1245,18 @@ fn duration_from_samples(sample_count: u64, sample_rate: u32) -> Duration {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{AudioChunkBatcher, LinearResampler, MicrophoneConverter, TARGET_SAMPLE_RATE};
+    use super::{
+        AudioChunkBatcher, AudioConverter, LinearResampler, TARGET_BATCH_DURATION_MS,
+        TARGET_SAMPLE_RATE,
+    };
+
+    fn batch_duration() -> Duration {
+        Duration::from_millis(TARGET_BATCH_DURATION_MS)
+    }
+
+    fn batch_samples() -> usize {
+        (TARGET_SAMPLE_RATE as u64 * TARGET_BATCH_DURATION_MS / 1000) as usize
+    }
 
     #[test]
     fn linear_resampler_downsamples_exact_ratio() {
@@ -875,7 +1272,7 @@ mod tests {
 
     #[test]
     fn microphone_converter_downmixes_stereo() {
-        let mut converter = MicrophoneConverter::new(2, TARGET_SAMPLE_RATE, TARGET_SAMPLE_RATE);
+        let mut converter = AudioConverter::new(2, TARGET_SAMPLE_RATE, TARGET_SAMPLE_RATE);
         let output = converter.push_samples(&[0.5f32, -0.5f32, 1.0f32, 0.0f32]);
 
         assert_eq!(output.len(), 2);
@@ -897,19 +1294,23 @@ mod tests {
 
     #[test]
     fn audio_chunk_batcher_groups_small_inputs_into_target_size() {
-        let mut batcher = AudioChunkBatcher::new(16_000, Duration::from_millis(100));
+        let mut batcher = AudioChunkBatcher::new(TARGET_SAMPLE_RATE, batch_duration());
         let base = Instant::now();
-        assert!(batcher.push(&vec![0.25; 800], base).is_empty());
+        let half_batch = batch_samples() / 2;
+        assert!(batcher.push(&vec![0.25; half_batch], base).is_empty());
 
-        let chunks = batcher.push(&vec![0.25; 800], base + Duration::from_millis(50));
+        let chunks = batcher.push(
+            &vec![0.25; half_batch],
+            base + Duration::from_millis(TARGET_BATCH_DURATION_MS / 2),
+        );
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].samples.len(), 1600);
+        assert_eq!(chunks[0].samples.len(), batch_samples());
         assert!(chunks[0].has_activity);
     }
 
     #[test]
     fn audio_chunk_batcher_flushes_remainder() {
-        let mut batcher = AudioChunkBatcher::new(16_000, Duration::from_millis(100));
+        let mut batcher = AudioChunkBatcher::new(TARGET_SAMPLE_RATE, batch_duration());
         assert!(batcher.push(&vec![0.25; 400], Instant::now()).is_empty());
 
         let tail = batcher.flush_audio().expect("tail should be present");
@@ -918,22 +1319,19 @@ mod tests {
 
     #[test]
     fn audio_chunk_batcher_tracks_chunk_start_from_audio_clock() {
-        let mut batcher = AudioChunkBatcher::new(16_000, Duration::from_millis(100));
+        let mut batcher = AudioChunkBatcher::new(TARGET_SAMPLE_RATE, batch_duration());
         let received_at = Instant::now();
 
-        let chunks = batcher.push(&vec![0.25; 1600], received_at);
+        let chunks = batcher.push(&vec![0.25; batch_samples()], received_at);
 
         assert_eq!(chunks.len(), 1);
-        assert_eq!(
-            chunks[0].started_at + Duration::from_millis(100),
-            received_at
-        );
+        assert_eq!(chunks[0].started_at + batch_duration(), received_at);
     }
 
     #[test]
     fn silence_chunk_is_marked_inactive() {
-        let mut batcher = AudioChunkBatcher::new(16_000, Duration::from_millis(100));
-        let chunks = batcher.push(&vec![0.0; 1600], Instant::now());
+        let mut batcher = AudioChunkBatcher::new(TARGET_SAMPLE_RATE, batch_duration());
+        let chunks = batcher.push(&vec![0.0; batch_samples()], Instant::now());
 
         assert_eq!(chunks.len(), 1);
         assert!(!chunks[0].has_activity);

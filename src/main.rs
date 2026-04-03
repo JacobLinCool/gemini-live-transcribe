@@ -32,6 +32,7 @@ use crate::transcriber::{
 use crate::ui::{App, AppEvent, UsageSnapshot};
 
 const DEFAULT_MODEL: &str = "gemini-3.1-flash-live-preview";
+const DEFAULT_SYSTEM_INSTRUCTION: &str = "reply with less than 3 words.";
 const DEFAULT_LOG_MAX_FILES: usize = 100;
 const TRANSCRIBER_SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 const RECONNECT_BACKOFF_BASE: Duration = Duration::from_millis(500);
@@ -797,13 +798,14 @@ fn default_home_config_toml() -> String {
             "\n",
             "# api_key = \"YOUR_GEMINI_API_KEY\"\n",
             "model = \"{model}\"\n",
-            "# instruction = \"Keep filler words and do not rewrite numbers.\"\n",
+            "# instruction = \"{instruction}\"\n",
             "# sources = [\"microphone\"]\n",
             "\n",
             "[logs]\n",
             "max_files = {max_files}\n"
         ),
         model = DEFAULT_MODEL,
+        instruction = DEFAULT_SYSTEM_INSTRUCTION,
         max_files = DEFAULT_LOG_MAX_FILES
     )
 }
@@ -854,17 +856,20 @@ fn normalize_sources_opt(sources: Option<Vec<SourceKind>>) -> Option<Vec<SourceK
 }
 
 fn compose_system_instruction(custom: Option<&str>) -> Option<String> {
-    custom
-        .map(str::trim)
-        .filter(|custom| !custom.is_empty())
-        .map(str::to_owned)
+    Some(
+        custom
+            .map(str::trim)
+            .filter(|custom| !custom.is_empty())
+            .unwrap_or(DEFAULT_SYSTEM_INSTRUCTION)
+            .to_owned(),
+    )
 }
 
 fn preference_summary(custom: Option<&str>) -> String {
     if custom.is_some_and(|custom| !custom.trim().is_empty()) {
         "prompt: custom".to_owned()
     } else {
-        "prompt: off".to_owned()
+        "prompt: default".to_owned()
     }
 }
 
@@ -876,9 +881,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        HomeConfig, LogsConfig, TurnTimingTracker, compose_system_instruction,
-        default_home_config_toml, ensure_home_config_file, normalize_sources_opt,
-        preference_summary, resolve_log_max_files, sanitize_instruction, sanitize_text,
+        DEFAULT_SYSTEM_INSTRUCTION, HomeConfig, LogsConfig, TurnTimingTracker,
+        compose_system_instruction, default_home_config_toml, ensure_home_config_file,
+        normalize_sources_opt, preference_summary, resolve_log_max_files, sanitize_instruction,
+        sanitize_text,
     };
     use crate::capture::{AudioChunk, SourceKind};
 
@@ -902,8 +908,16 @@ mod tests {
     }
 
     #[test]
+    fn composes_system_instruction_from_default_instruction() {
+        let instruction =
+            compose_system_instruction(None).expect("default instruction should be present");
+
+        assert_eq!(instruction, DEFAULT_SYSTEM_INSTRUCTION);
+    }
+
+    #[test]
     fn summarizes_preferences_for_status_bar() {
-        assert_eq!(preference_summary(None), "prompt: off");
+        assert_eq!(preference_summary(None), "prompt: default");
         assert_eq!(
             preference_summary(Some("Use short sentences")),
             "prompt: custom"
@@ -1057,6 +1071,7 @@ max_files = 100
 
         let raw = fs::read_to_string(&path).expect("config should be readable");
         assert!(raw.contains("model = \"gemini-3.1-flash-live-preview\""));
+        assert!(raw.contains("# instruction = \"reply with less than 3 words.\""));
         assert!(raw.contains("[logs]"));
         assert!(raw.contains("max_files = 100"));
 

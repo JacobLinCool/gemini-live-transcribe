@@ -13,7 +13,8 @@ The tool is intentionally small, but it still has a few hard operational invaria
 
 - Missing `HOME` breaks config/log path resolution.
 - Missing Microphone permission blocks `microphone` capture.
-- Missing Screen Recording permission blocks `system-audio` capture.
+- Missing System Audio Recording permission blocks `system-audio` capture.
+- Missing default output device blocks `system-audio` capture.
 - Gemini Live connection failures, `goAway` renewal, and close frames can interrupt one source while others keep running.
 - Disk pressure can block build/test workflows and can also interfere with JSONL logging if the home volume is full.
 

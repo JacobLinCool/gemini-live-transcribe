@@ -12,7 +12,7 @@
 ## Layers And Dependency Direction
 
 - `src/main.rs`: top-level composition root. Resolves configuration, starts capture workers and per-source transcriber supervisors, and runs the TUI event loop.
-- `src/capture.rs`: source-specific audio capture. Converts local device or ScreenCaptureKit output into normalized mono `AudioChunk` values at `16 kHz`.
+- `src/capture.rs`: source-specific audio capture. Converts local device input or Core Audio tap output into normalized mono `AudioChunk` values at `16 kHz`. `system-audio` is captured from the default output device through a private aggregate device, not through display capture.
 - `src/transcriber.rs`: Gemini Live boundary. Builds setup payloads, sends PCM audio, parses inbound server messages, and emits typed session events.
 - `src/ui.rs`: ratatui surface. Owns `App`, `AppEvent`, per-source pane state, timestamp formatting, wrapping behavior, and token/context presentation.
 - `src/session_log.rs`: JSONL audit trail for outbound setup/audio lifecycle events and inbound Gemini Live messages.
@@ -22,7 +22,7 @@ Dependency direction is strictly inward:
 
 1. capture/transcriber/session_log/paths do not depend on ui
 2. `main.rs` is the only place that composes capture, transcriber, logging, and UI together
-3. Gemini Live, cpal, ScreenCaptureKit, and terminal I/O are boundary integrations, not core state owners
+3. Gemini Live, cpal, Core Audio taps, and terminal I/O are boundary integrations, not core state owners
 
 ## Cross-Cutting Concerns
 

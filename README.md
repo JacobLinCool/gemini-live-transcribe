@@ -7,6 +7,7 @@ It can capture your microphone, system audio, or both at the same time, then ren
 ## Highlights
 
 - Separate transcript pane per source: `microphone` and `system-audio`
+- `system-audio` uses a Core Audio tap on the default output device, not screen capture
 - Relative timestamps in `HH:MM:SS |` format
 - Live Gemini context token count in each pane title
 - Session renewal with context compression and resumption enabled
@@ -18,7 +19,7 @@ It can capture your microphone, system audio, or both at the same time, then ren
 - macOS 15 or newer
 - Xcode command line tools
 - A Gemini API key
-- Screen Recording permission if you want `system-audio`
+- System Audio Recording permission if you want `system-audio`
 - Microphone permission if you want `microphone`
 
 ## Install
@@ -68,7 +69,7 @@ Add a custom transcription instruction:
 ```bash
 gemini-live-transcribe \
   --source microphone \
-  --instruction "Keep filler words and do not rewrite numbers."
+  --instruction "reply with less than 3 words."
 ```
 
 Print the config and log paths:
@@ -87,7 +88,7 @@ gemini-live-transcribe update
 
 The first time you capture audio, macOS may ask for permissions.
 
-- `system-audio` needs Screen Recording permission for your terminal or host app
+- `system-audio` needs System Audio Recording permission for your terminal or host app
 - `microphone` needs Microphone permission
 
 If permissions were denied earlier, re-enable them in macOS System Settings and restart the app.
@@ -112,7 +113,7 @@ Example config:
 
 # api_key = "YOUR_GEMINI_API_KEY"
 model = "gemini-3.1-flash-live-preview"
-# instruction = "Keep filler words and do not rewrite numbers."
+# instruction = "reply with less than 3 words."
 # sources = ["microphone"]
 
 [logs]
@@ -122,7 +123,7 @@ max_files = 100
 Notes:
 
 - `api_key` stores the Gemini API key
-- `instruction` biases transcription output
+- `instruction` biases transcription output; if omitted, the runtime default is `reply with less than 3 words.`
 - `sources` accepts `microphone` and `system-audio`
 - `[logs].max_files` must be at least `1`
 - existing config files are not overwritten
