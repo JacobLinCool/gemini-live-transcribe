@@ -16,7 +16,7 @@ This tool is built for an operator who wants live transcription with minimal set
 
 ## Tradeoff Rules
 
-- Bias transcription behavior through Gemini Live instructions first, not through aggressive post-processing.
+- Bias finalized transcript behavior through the transcription profile and finalizer prompt, not through aggressive post-processing.
 - Keep logs rich enough for offline debugging, but do not persist raw audio payloads.
 - Treat source isolation as a product feature, not just an implementation detail.
 - When long-running sessions require provider-specific machinery such as resumption or context compression, expose the resulting state honestly instead of pretending the connection is immortal.

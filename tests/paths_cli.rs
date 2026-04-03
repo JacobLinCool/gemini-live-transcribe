@@ -8,6 +8,8 @@ struct PathsTestEnv {
     root: PathBuf,
     config_path: PathBuf,
     logs_dir: PathBuf,
+    transcripts_dir: PathBuf,
+    debug_dir: PathBuf,
     env_pairs: Vec<(&'static str, PathBuf)>,
 }
 
@@ -31,12 +33,17 @@ fn paths_subcommand_prints_config_and_logs_paths() {
 
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf-8");
     let lines = stdout.lines().collect::<Vec<_>>();
-    assert_eq!(lines.len(), 2, "stdout was: {stdout:?}");
+    assert_eq!(lines.len(), 4, "stdout was: {stdout:?}");
     assert_eq!(
         lines[0],
         format!("config_path={}", env.config_path.display())
     );
     assert_eq!(lines[1], format!("logs_dir={}", env.logs_dir.display()));
+    assert_eq!(
+        lines[2],
+        format!("transcripts_dir={}", env.transcripts_dir.display())
+    );
+    assert_eq!(lines[3], format!("debug_dir={}", env.debug_dir.display()));
     assert!(output.stderr.is_empty(), "stderr should be empty");
     assert!(
         env.config_path.exists(),
@@ -69,6 +76,8 @@ fn create_test_env() -> PathsTestEnv {
         root,
         config_path: app_dir.join("config.toml"),
         logs_dir: app_dir.join("logs"),
+        transcripts_dir: app_dir.join("transcripts"),
+        debug_dir: app_dir.join("debug"),
         env_pairs: vec![("HOME", home)],
     }
 }
@@ -82,6 +91,8 @@ fn create_test_env() -> PathsTestEnv {
         root,
         config_path: home.join(".config/gemini-live-transcribe/config.toml"),
         logs_dir: home.join(".local/share/gemini-live-transcribe/logs"),
+        transcripts_dir: home.join(".local/share/gemini-live-transcribe/transcripts"),
+        debug_dir: home.join(".local/share/gemini-live-transcribe/debug"),
         env_pairs: vec![("HOME", home)],
     }
 }
@@ -99,6 +110,8 @@ fn create_test_env() -> PathsTestEnv {
         root,
         config_path: appdata.join("gemini-live-transcribe/config/config.toml"),
         logs_dir: local_appdata.join("gemini-live-transcribe/data/logs"),
+        transcripts_dir: local_appdata.join("gemini-live-transcribe/data/transcripts"),
+        debug_dir: local_appdata.join("gemini-live-transcribe/data/debug"),
         env_pairs: vec![
             ("USERPROFILE", user_profile.clone()),
             ("HOME", user_profile),

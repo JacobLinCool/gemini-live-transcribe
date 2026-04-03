@@ -10,10 +10,12 @@ It can capture your microphone on macOS, Linux, and Windows. `system-audio` rema
 - Separate transcript pane per source: `microphone` everywhere, `system-audio` on macOS
 - `system-audio` uses a Core Audio tap on the default output device, not screen capture
 - Relative timestamps in `HH:MM:SS |` format
+- Draft and finalized transcript lifecycle per source
 - Live Gemini context token count in each pane title
 - Session renewal with context compression and resumption enabled
 - Persistent config in the OS-standard app config directory
 - Per-session JSONL logs in the OS-standard app data directory
+- Final transcript JSON export on normal shutdown
 
 ## Requirements
 
@@ -65,18 +67,25 @@ Capture both microphone and system audio on macOS:
 gemini-live-transcribe --source microphone --source system-audio
 ```
 
-Add a custom transcription instruction:
+Add separate draft and finalizer instructions:
 
 ```bash
 gemini-live-transcribe \
   --source microphone \
-  --instruction "reply with less than 3 words."
+  --draft-instruction "reply with less than 3 words." \
+  --finalizer-instruction "prefer speaker labels when obvious."
 ```
 
 Print the config and log paths:
 
 ```bash
 gemini-live-transcribe paths
+```
+
+Record per-source debug WAVs of the exact audio sent to Gemini:
+
+```bash
+gemini-live-transcribe --debug
 ```
 
 Update an installed binary to the latest GitHub release:
@@ -108,6 +117,8 @@ Resolution order is:
 3. the generated per-user config file
 4. Interactive prompt
 
+`--debug` is CLI-only and writes per-source `16 kHz mono PCM` WAV dumps under the OS-standard `debug/` data directory.
+
 Example config:
 
 ```toml
@@ -116,8 +127,17 @@ Example config:
 
 # api_key = "YOUR_GEMINI_API_KEY"
 model = "gemini-3.1-flash-live-preview"
-# instruction = "reply with less than 3 words."
+# draft_instruction = "reply with less than 3 words."
+# finalizer_instruction = "prefer speaker labels when obvious."
 # sources = ["microphone"]
+
+[transcription]
+primary_language = "zh-Hant"
+allowed_languages = ["en"]
+keep_disfluencies = true
+collapse_self_corrections = false
+dedupe_immediate_repetition = false
+numeral_policy = "preserve"
 
 [logs]
 max_files = 100
@@ -126,7 +146,12 @@ max_files = 100
 Notes:
 
 - `api_key` stores the Gemini API key
-- `instruction` biases transcription output; if omitted, the runtime default is `reply with less than 3 words.`
+- `[transcription]` controls the finalized transcript shape
+- `primary_language` is the fallback output language for unsupported spoken languages
+- `allowed_languages` may remain as spoken in the finalized transcript
+- `draft_instruction` controls the low-latency first pass
+- `finalizer_instruction` adds extra operator guidance to the second pass
+- `--debug` writes `debug/<session_id>/<source>.wav` plus a small metadata JSON for capture diagnostics
 - `sources` accepts `microphone` everywhere and `system-audio` on macOS
 - `[logs].max_files` must be at least `1`
 - existing config files are not overwritten
@@ -134,7 +159,7 @@ Notes:
 
 ## Logs
 
-Each source writes a JSONL session log under the OS-standard app data directory.
+Each source/stream pair writes a JSONL session log under the OS-standard app data directory.
 
 Logs include:
 
@@ -145,9 +170,13 @@ Logs include:
 Large base64 audio payloads are sanitized before being written to disk.
 Log retention is count-based: after a new session starts, the app removes the oldest `*.jsonl` files until only `max_files` remain.
 
+On normal shutdown, the app also writes a transcript export to the OS-standard `transcripts/` data directory as `<session_id>.json`.
+This file contains the finalized text plus fallback state for failed or unfinished turns.
+
 ## Controls
 
 - `q`: quit
+  The app stops capture, drains pending finalization for a bounded period, then writes the transcript JSON export.
 
 ## Build From Source
 

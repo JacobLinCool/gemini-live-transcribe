@@ -18,6 +18,7 @@ pub struct SessionLogger {
     inner: Arc<Mutex<LogWriter>>,
     path: Arc<PathBuf>,
     source: SourceKind,
+    stream_label: Arc<String>,
 }
 
 struct LogWriter {
@@ -29,7 +30,12 @@ struct LogWriter {
 }
 
 impl SessionLogger {
-    pub fn create(source: SourceKind, model: &str, max_files: usize) -> Result<Self> {
+    pub fn create(
+        source: SourceKind,
+        stream_label: &str,
+        model: &str,
+        max_files: usize,
+    ) -> Result<Self> {
         let log_dir =
             home_logs_dir().ok_or_else(|| anyhow!("application log directory is unavailable"))?;
         fs::create_dir_all(&log_dir)
@@ -37,7 +43,8 @@ impl SessionLogger {
 
         let timestamp_ms = unix_timestamp_ms();
         let source_name = source.title().replace(' ', "-");
-        let path = log_dir.join(format!("{timestamp_ms}-{source_name}.jsonl"));
+        let stream_name = stream_label.trim().replace(' ', "-");
+        let path = log_dir.join(format!("{timestamp_ms}-{source_name}-{stream_name}.jsonl"));
         let file = OpenOptions::new()
             .create_new(true)
             .append(true)
@@ -49,6 +56,7 @@ impl SessionLogger {
             inner: Arc::new(Mutex::new(LogWriter::new(file))),
             path: Arc::new(path),
             source,
+            stream_label: Arc::new(stream_name),
         };
 
         logger.log_record(
@@ -56,6 +64,7 @@ impl SessionLogger {
             "session_start",
             json!({
                 "model": model,
+                "stream_label": logger.stream_label.as_ref(),
                 "log_path": logger.path().display().to_string(),
             }),
         );
@@ -99,6 +108,7 @@ impl SessionLogger {
         let record = json!({
             "ts_unix_ms": unix_timestamp_ms(),
             "source": self.source,
+            "stream_label": self.stream_label.as_ref(),
             "direction": direction,
             "event": event,
             "payload": payload,
