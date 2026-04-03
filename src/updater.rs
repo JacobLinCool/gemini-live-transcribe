@@ -150,7 +150,7 @@ impl Drop for TempDir {
 fn download_release_archive(url: &str, archive_path: &Path) -> Result<()> {
     #[cfg(windows)]
     {
-        return run_command(
+        run_command(
             powershell_command()
                 .arg("-Command")
                 .arg(
@@ -160,7 +160,7 @@ fn download_release_archive(url: &str, archive_path: &Path) -> Result<()> {
                 .env("GEMINI_UPDATE_URL", url)
                 .env("GEMINI_UPDATE_OUT", archive_path),
             &format!("download release archive from {url}"),
-        );
+        )
     }
 
     #[cfg(not(windows))]
