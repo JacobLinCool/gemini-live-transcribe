@@ -18,20 +18,34 @@ resolve_target() {
   os="$(uname -s)"
   arch="$(uname -m)"
 
-  if [[ "$os" != "Darwin" ]]; then
-    echo "This installer only supports macOS." >&2
-    exit 1
-  fi
-
-  case "$arch" in
-    arm64|aarch64)
-      echo "aarch64-apple-darwin"
+  case "$os" in
+    Darwin)
+      case "$arch" in
+        arm64|aarch64)
+          echo "aarch64-apple-darwin"
+          ;;
+        x86_64)
+          echo "x86_64-apple-darwin"
+          ;;
+        *)
+          echo "Unsupported macOS architecture: $arch" >&2
+          exit 1
+          ;;
+      esac
       ;;
-    x86_64)
-      echo "x86_64-apple-darwin"
+    Linux)
+      case "$arch" in
+        x86_64)
+          echo "x86_64-unknown-linux-gnu"
+          ;;
+        *)
+          echo "Unsupported Linux architecture: $arch" >&2
+          exit 1
+          ;;
+      esac
       ;;
     *)
-      echo "Unsupported macOS architecture: $arch" >&2
+      echo "This installer supports macOS and Linux. On Windows, download the release zip instead." >&2
       exit 1
       ;;
   esac

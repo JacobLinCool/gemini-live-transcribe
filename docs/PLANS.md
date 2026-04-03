@@ -17,5 +17,5 @@ Execution plans live under `docs/exec-plans/`.
 
 ## Current State
 
-- There are no committed active execution plans yet.
+- Active execution plans live in `docs/exec-plans/active/`. Treat the directory listing as the source of truth for which plans are currently in flight.
 - The tech-debt tracker is the canonical queue for known follow-up work that is not being executed in the current diff.

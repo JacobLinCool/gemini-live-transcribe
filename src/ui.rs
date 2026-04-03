@@ -16,23 +16,50 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use unicode_width::UnicodeWidthChar;
 
 use crate::capture::SourceKind;
+use crate::transcript::DisplayAction;
 
 const MAX_NOTICES: usize = 8;
 const MAX_TURNS_PER_SOURCE: usize = 512;
 
 #[derive(Debug, Clone)]
 pub enum AppEvent {
-    SourceStatus {
+    DraftStatus {
         source: SourceKind,
         status: String,
     },
-    Transcript {
+    FinalizerStatus {
         source: SourceKind,
+        status: String,
+    },
+    QueueMetrics {
+        source: SourceKind,
+        queue_depth: usize,
+        pending_audio_secs: f32,
+    },
+    CaptureLevel {
+        source: SourceKind,
+        rms: f32,
+    },
+    DraftTranscript {
+        source: SourceKind,
+        turn_id: String,
         at: Instant,
         text: String,
     },
-    TurnComplete {
+    TurnPending {
         source: SourceKind,
+        turn_id: String,
+    },
+    TurnFinalized {
+        source: SourceKind,
+        turn_id: String,
+        text: String,
+        display_action: DisplayAction,
+    },
+    TurnFailed {
+        source: SourceKind,
+        turn_id: String,
+        error: String,
     },
     Usage {
         source: SourceKind,
@@ -61,7 +88,7 @@ pub struct UsageSnapshot {
 pub struct App {
     started_at: Instant,
     model: String,
-    preference_summary: String,
+    profile_summary: String,
     sources: Vec<SourceKind>,
     panes: HashMap<SourceKind, SourcePane>,
     notices: VecDeque<String>,
@@ -69,19 +96,35 @@ pub struct App {
 
 #[derive(Debug, Default)]
 struct SourcePane {
-    status: String,
+    draft_status: String,
+    finalizer_status: String,
+    capture_rms: Option<f32>,
+    queue_depth: usize,
+    pending_audio_secs: f32,
     turns: VecDeque<TimestampedTurn>,
-    draft: Option<TimestampedTurn>,
     usage: Option<UsageSnapshot>,
     error: Option<String>,
     content_revision: u64,
     layout_cache: Option<PaneLayoutCache>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnState {
+    Draft,
+    PendingFinalization,
+    Final,
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TimestampedTurn {
+    turn_id: String,
     started_at: Duration,
-    text: String,
+    draft_text: String,
+    final_text: Option<String>,
+    state: TurnState,
+    display_action: DisplayAction,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,14 +137,15 @@ struct PaneLayoutCache {
 }
 
 impl App {
-    pub fn new(model: String, preference_summary: String, sources: Vec<SourceKind>) -> Self {
+    pub fn new(model: String, profile_summary: String, sources: Vec<SourceKind>) -> Self {
         let panes = sources
             .iter()
             .map(|source| {
                 (
                     *source,
                     SourcePane {
-                        status: "starting".into(),
+                        draft_status: "starting".into(),
+                        finalizer_status: "starting".into(),
                         ..SourcePane::default()
                     },
                 )
@@ -111,7 +155,7 @@ impl App {
         Self {
             started_at: Instant::now(),
             model,
-            preference_summary,
+            profile_summary,
             sources,
             panes,
             notices: VecDeque::new(),
@@ -120,23 +164,71 @@ impl App {
 
     pub fn apply(&mut self, event: AppEvent) -> bool {
         match event {
-            AppEvent::SourceStatus { source, status } => {
+            AppEvent::DraftStatus { source, status } => {
                 if let Some(pane) = self.panes.get_mut(&source) {
-                    return pane.set_status(status);
+                    return pane.set_draft_status(status);
                 }
             }
-            AppEvent::Transcript { source, at, text } => {
+            AppEvent::FinalizerStatus { source, status } => {
+                if let Some(pane) = self.panes.get_mut(&source) {
+                    return pane.set_finalizer_status(status);
+                }
+            }
+            AppEvent::QueueMetrics {
+                source,
+                queue_depth,
+                pending_audio_secs,
+            } => {
+                if let Some(pane) = self.panes.get_mut(&source) {
+                    return pane.set_queue_metrics(queue_depth, pending_audio_secs);
+                }
+            }
+            AppEvent::CaptureLevel { source, rms } => {
+                if let Some(pane) = self.panes.get_mut(&source) {
+                    return pane.set_capture_rms(rms);
+                }
+            }
+            AppEvent::DraftTranscript {
+                source,
+                turn_id,
+                at,
+                text,
+            } => {
                 if let Some(pane) = self.panes.get_mut(&source) {
                     return pane.update_draft(
+                        turn_id,
                         normalize_transcript_text(&text),
                         at.checked_duration_since(self.started_at)
                             .unwrap_or(Duration::ZERO),
                     );
                 }
             }
-            AppEvent::TurnComplete { source } => {
+            AppEvent::TurnPending { source, turn_id } => {
                 if let Some(pane) = self.panes.get_mut(&source) {
-                    return pane.commit_draft();
+                    return pane.mark_pending(&turn_id);
+                }
+            }
+            AppEvent::TurnFinalized {
+                source,
+                turn_id,
+                text,
+                display_action,
+            } => {
+                if let Some(pane) = self.panes.get_mut(&source) {
+                    return pane.mark_final(
+                        &turn_id,
+                        normalize_transcript_text(&text),
+                        display_action,
+                    );
+                }
+            }
+            AppEvent::TurnFailed {
+                source,
+                turn_id,
+                error,
+            } => {
+                if let Some(pane) = self.panes.get_mut(&source) {
+                    return pane.mark_failed(&turn_id, error);
                 }
             }
             AppEvent::Usage { source, usage } => {
@@ -233,7 +325,7 @@ impl App {
 
     fn render_controls(&self, frame: &mut ratatui::Frame, area: Rect) {
         let lines = vec![
-            Line::from(format!("q quit | {}", self.preference_summary)),
+            Line::from(format!("q quit | {}", self.profile_summary)),
             Line::from("Each source streams to Gemini Live independently."),
         ];
 
@@ -246,21 +338,53 @@ impl App {
 }
 
 impl SourcePane {
-    fn set_status(&mut self, status: String) -> bool {
-        if self.status == status {
+    fn set_draft_status(&mut self, status: String) -> bool {
+        if self.draft_status == status {
             return false;
         }
+        self.draft_status = status;
+        self.invalidate_layout();
+        true
+    }
 
-        self.status = status;
+    fn set_finalizer_status(&mut self, status: String) -> bool {
+        if self.finalizer_status == status {
+            return false;
+        }
+        self.finalizer_status = status;
+        self.invalidate_layout();
+        true
+    }
+
+    fn set_queue_metrics(&mut self, queue_depth: usize, pending_audio_secs: f32) -> bool {
+        if self.queue_depth == queue_depth
+            && (self.pending_audio_secs - pending_audio_secs).abs() < f32::EPSILON
+        {
+            return false;
+        }
+        self.queue_depth = queue_depth;
+        self.pending_audio_secs = pending_audio_secs;
+        self.invalidate_layout();
+        true
+    }
+
+    fn set_capture_rms(&mut self, rms: f32) -> bool {
+        let rms = quantize_rms(rms);
+        if self.capture_rms == Some(rms) {
+            return false;
+        }
+        self.capture_rms = Some(rms);
+        self.invalidate_layout();
         true
     }
 
     fn set_error(&mut self, error: String) -> bool {
-        if self.status == "error" && self.error.as_deref() == Some(error.as_str()) {
+        if self.error.as_deref() == Some(error.as_str()) {
             return false;
         }
 
-        self.status = "error".into();
+        self.draft_status = "error".into();
+        self.finalizer_status = "error".into();
         self.error = Some(error);
         self.invalidate_layout();
         true
@@ -300,62 +424,83 @@ impl SourcePane {
         *current != previous
     }
 
-    fn update_draft(&mut self, text: String, started_at: Duration) -> bool {
+    fn update_draft(&mut self, turn_id: String, text: String, started_at: Duration) -> bool {
         if text.is_empty() {
             return false;
         }
 
-        match self.draft.as_mut() {
-            Some(draft) if draft.text == text => false,
-            Some(draft) if text.starts_with(&draft.text) || draft.text.starts_with(&text) => {
-                draft.text = text;
-                self.invalidate_layout();
-                true
+        if let Some(turn) = self.turns.iter_mut().find(|turn| turn.turn_id == turn_id) {
+            if turn.draft_text == text {
+                return false;
             }
-            Some(_) => {
-                let previous = self
-                    .draft
-                    .take()
-                    .expect("draft should exist when starting a new turn");
-                self.push_turn(previous);
-                self.draft = Some(TimestampedTurn { started_at, text });
-                self.invalidate_layout();
-                true
-            }
-            None => {
-                self.draft = Some(TimestampedTurn { started_at, text });
-                self.invalidate_layout();
-                true
-            }
+            turn.draft_text = text;
+            turn.started_at = turn.started_at.min(started_at);
+            turn.state = TurnState::Draft;
+            self.invalidate_layout();
+            return true;
         }
-    }
 
-    fn commit_draft(&mut self) -> bool {
-        if self.draft.is_none() {
-            return false;
+        if self.turns.len() == MAX_TURNS_PER_SOURCE {
+            self.turns.pop_front();
         }
-        let draft = self
-            .draft
-            .take()
-            .expect("draft should exist when committing a turn");
-        self.push_turn(draft);
+        self.turns.push_back(TimestampedTurn {
+            turn_id,
+            started_at,
+            draft_text: text,
+            final_text: None,
+            state: TurnState::Draft,
+            display_action: DisplayAction::NewBlock,
+            error: None,
+        });
         self.invalidate_layout();
         true
     }
 
-    fn push_turn(&mut self, turn: TimestampedTurn) {
-        if self.turns.len() == MAX_TURNS_PER_SOURCE {
-            self.turns.pop_front();
+    fn mark_pending(&mut self, turn_id: &str) -> bool {
+        let Some(turn) = self.turns.iter_mut().find(|turn| turn.turn_id == turn_id) else {
+            return false;
+        };
+        if turn.state == TurnState::PendingFinalization {
+            return false;
         }
-        self.turns.push_back(turn);
+        turn.state = TurnState::PendingFinalization;
+        self.invalidate_layout();
+        true
+    }
+
+    fn mark_final(&mut self, turn_id: &str, text: String, display_action: DisplayAction) -> bool {
+        let Some(turn) = self.turns.iter_mut().find(|turn| turn.turn_id == turn_id) else {
+            return false;
+        };
+        turn.final_text = Some(text);
+        turn.state = TurnState::Final;
+        turn.display_action = display_action;
+        turn.error = None;
+        self.invalidate_layout();
+        true
+    }
+
+    fn mark_failed(&mut self, turn_id: &str, error: String) -> bool {
+        let Some(turn) = self.turns.iter_mut().find(|turn| turn.turn_id == turn_id) else {
+            return false;
+        };
+        if turn.state == TurnState::Failed && turn.error.as_deref() == Some(error.as_str()) {
+            return false;
+        }
+        turn.state = TurnState::Failed;
+        turn.error = Some(error);
+        self.invalidate_layout();
+        true
     }
 
     fn border_style(&self) -> Style {
         if self.error.is_some() {
             Style::default().fg(Color::Red)
-        } else if self.status == "resuming" || self.status == "reconnecting" {
+        } else if is_degraded_status(&self.draft_status)
+            || is_degraded_status(&self.finalizer_status)
+        {
             Style::default().fg(Color::Yellow)
-        } else if self.status == "listening" || self.status == "capturing" {
+        } else if self.draft_status == "listening" || self.draft_status == "capturing" {
             Style::default().fg(Color::Green)
         } else {
             Style::default().fg(Color::Gray)
@@ -363,15 +508,33 @@ impl SourcePane {
     }
 
     fn title(&self, source: SourceKind) -> String {
+        let rms = self
+            .capture_rms
+            .map(|rms| format!("rms {rms:.3}"))
+            .unwrap_or_else(|| "rms --".to_owned());
+        let queue = if self.queue_depth == 0 {
+            "q 0".to_owned()
+        } else {
+            format!("q {} | {:.1}s", self.queue_depth, self.pending_audio_secs)
+        };
         match &self.usage {
             Some(usage) if usage.prompt_token_count > 0 => format!(
-                "{} [{} | ctx {}]",
+                "{} [d:{} | f:{} | {} | {} | ctx {}]",
                 source.title(),
-                self.status,
+                self.draft_status,
+                self.finalizer_status,
+                rms,
+                queue,
                 abbreviate_token_count(usage.prompt_token_count)
             ),
-            None => format!("{} [{}]", source.title(), self.status),
-            Some(_) => format!("{} [{}]", source.title(), self.status),
+            _ => format!(
+                "{} [d:{} | f:{} | {} | {}]",
+                source.title(),
+                self.draft_status,
+                self.finalizer_status,
+                rms,
+                queue
+            ),
         }
     }
 
@@ -404,18 +567,53 @@ impl SourcePane {
     }
 
     fn display_lines(&self) -> Vec<DisplayLine> {
-        let mut lines = self
-            .turns
-            .iter()
-            .cloned()
-            .map(|turn| DisplayLine::transcript(turn, Style::default()))
-            .collect::<Vec<_>>();
+        let mut lines = Vec::new();
+        let mut previous_finalized_exists = false;
 
-        if let Some(draft) = &self.draft {
+        for turn in &self.turns {
+            let prefix_override = if turn.state == TurnState::Final
+                && turn.display_action == DisplayAction::AppendPreviousBlock
+                && previous_finalized_exists
+            {
+                Some(" ".repeat("00:00:00 | ".len()))
+            } else {
+                None
+            };
+
+            let (text, style) = match turn.state {
+                TurnState::Draft => (
+                    format!("[draft] {}", turn.draft_text),
+                    Style::default().fg(Color::Yellow),
+                ),
+                TurnState::PendingFinalization => (
+                    format!("[pending] {}", turn.draft_text),
+                    Style::default().fg(Color::LightYellow),
+                ),
+                TurnState::Final => (
+                    turn.final_text.clone().unwrap_or_default(),
+                    Style::default().fg(Color::White),
+                ),
+                TurnState::Failed => (
+                    format!("[failed] {}", turn.draft_text),
+                    Style::default().fg(Color::LightRed),
+                ),
+            };
+
             lines.push(DisplayLine::transcript(
-                draft.clone(),
-                Style::default().fg(Color::Yellow),
+                turn.started_at,
+                text,
+                style,
+                prefix_override,
             ));
+
+            if let Some(error) = &turn.error {
+                lines.push(DisplayLine::plain(
+                    format!("           {}", error),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+
+            previous_finalized_exists |= turn.state == TurnState::Final;
         }
 
         if lines.is_empty() {
@@ -440,6 +638,17 @@ impl SourcePane {
         self.content_revision = self.content_revision.wrapping_add(1);
         self.layout_cache = None;
     }
+}
+
+fn is_degraded_status(status: &str) -> bool {
+    matches!(
+        status,
+        "resuming" | "reconnecting" | "starting" | "connecting"
+    )
+}
+
+fn quantize_rms(rms: f32) -> f32 {
+    ((rms.max(0.0) * 1000.0).round()) / 1000.0
 }
 
 pub fn run(
@@ -556,10 +765,16 @@ impl DisplayLine {
         }
     }
 
-    fn transcript(turn: TimestampedTurn, style: Style) -> Self {
+    fn transcript(
+        started_at: Duration,
+        text: String,
+        style: Style,
+        prefix_override: Option<String>,
+    ) -> Self {
         Self {
-            prefix: format!("{} | ", format_relative_time(turn.started_at)),
-            text: turn.text,
+            prefix: prefix_override
+                .unwrap_or_else(|| format!("{} | ", format_relative_time(started_at))),
+            text,
             style,
         }
     }
@@ -750,44 +965,86 @@ mod tests {
     use std::time::Duration;
 
     use crate::capture::SourceKind;
+    use crate::transcript::DisplayAction;
 
     use super::{
-        SourcePane, UsageSnapshot, format_relative_time, normalize_transcript_text,
+        App, AppEvent, SourcePane, UsageSnapshot, format_relative_time, normalize_transcript_text,
         wrap_display_line, wrap_line,
     };
 
     #[test]
-    fn replaces_draft_when_server_expands_same_turn() {
+    fn updates_existing_draft_turn_by_id() {
         let mut pane = SourcePane::default();
-        pane.update_draft("hello".into(), Duration::from_secs(5));
-        pane.update_draft("hello world".into(), Duration::from_secs(6));
-
-        assert!(pane.turns.is_empty());
-        assert_eq!(
-            pane.draft,
-            Some(super::TimestampedTurn {
-                started_at: Duration::from_secs(5),
-                text: "hello world".into(),
-            })
+        pane.update_draft("turn-1".into(), "hello".into(), Duration::from_secs(5));
+        pane.update_draft(
+            "turn-1".into(),
+            "hello world".into(),
+            Duration::from_secs(6),
         );
+
+        assert_eq!(pane.turns.len(), 1);
+        assert_eq!(pane.turns[0].draft_text, "hello world");
+        assert_eq!(pane.turns[0].state, super::TurnState::Draft);
     }
 
     #[test]
-    fn commits_previous_draft_when_server_starts_new_segment() {
+    fn marks_turn_pending_and_finalized() {
         let mut pane = SourcePane::default();
-        pane.update_draft("hello".into(), Duration::from_secs(1));
-        pane.update_draft("another sentence".into(), Duration::from_secs(4));
+        pane.update_draft("turn-1".into(), "hello".into(), Duration::from_secs(1));
+        pane.mark_pending("turn-1");
+        pane.mark_final("turn-1", "hello world".into(), DisplayAction::NewBlock);
 
-        assert_eq!(pane.turns.len(), 1);
-        assert_eq!(pane.turns[0].text, "hello");
-        assert_eq!(pane.turns[0].started_at, Duration::from_secs(1));
-        assert_eq!(
-            pane.draft,
-            Some(super::TimestampedTurn {
-                started_at: Duration::from_secs(4),
-                text: "another sentence".into(),
-            })
+        assert_eq!(pane.turns[0].final_text.as_deref(), Some("hello world"));
+        assert_eq!(pane.turns[0].state, super::TurnState::Final);
+    }
+
+    #[test]
+    fn groups_append_previous_block_visually() {
+        let mut pane = SourcePane::default();
+        pane.update_draft("turn-1".into(), "first".into(), Duration::from_secs(1));
+        pane.mark_final("turn-1", "first".into(), DisplayAction::NewBlock);
+        pane.update_draft("turn-2".into(), "second".into(), Duration::from_secs(2));
+        pane.mark_final(
+            "turn-2",
+            "second".into(),
+            DisplayAction::AppendPreviousBlock,
         );
+
+        let lines = pane.display_lines();
+        assert_eq!(lines[1].prefix, "           ");
+    }
+
+    #[test]
+    fn app_updates_queue_metrics() {
+        let mut app = App::new(
+            "model".into(),
+            "lang: zh-Hant".into(),
+            vec![SourceKind::Microphone],
+        );
+
+        assert!(app.apply(AppEvent::QueueMetrics {
+            source: SourceKind::Microphone,
+            queue_depth: 2,
+            pending_audio_secs: 3.5,
+        }));
+    }
+
+    #[test]
+    fn app_updates_capture_rms() {
+        let mut app = App::new(
+            "model".into(),
+            "lang: zh-Hant".into(),
+            vec![SourceKind::Microphone],
+        );
+
+        assert!(app.apply(AppEvent::CaptureLevel {
+            source: SourceKind::Microphone,
+            rms: 0.0124,
+        }));
+        assert!(!app.apply(AppEvent::CaptureLevel {
+            source: SourceKind::Microphone,
+            rms: 0.01249,
+        }));
     }
 
     #[test]
@@ -836,30 +1093,19 @@ mod tests {
     }
 
     #[test]
-    fn reuses_cached_layout_when_height_changes_only() {
-        let mut pane = SourcePane::default();
-        assert!(pane.update_draft("abcdefgh".into(), Duration::from_secs(8)));
-
-        let first_text = pane.layout_for(4, 2).text.clone();
-        let first_revision = pane.layout_cache.as_ref().map(|cache| cache.revision);
-
-        let second_layout = pane.layout_for(4, 1);
-
-        assert_eq!(first_revision, Some(second_layout.revision));
-        assert_eq!(first_text, second_layout.text);
-        assert_eq!(second_layout.scroll, 4);
-    }
-
-    #[test]
     fn formats_relative_time_as_hms() {
         assert_eq!(format_relative_time(Duration::from_secs(0)), "00:00:00");
         assert_eq!(format_relative_time(Duration::from_secs(3661)), "01:01:01");
     }
 
     #[test]
-    fn includes_token_usage_in_pane_title() {
+    fn includes_queue_and_usage_in_title() {
         let mut pane = SourcePane {
-            status: "listening".into(),
+            draft_status: "listening".into(),
+            finalizer_status: "ready".into(),
+            capture_rms: Some(0.012),
+            queue_depth: 2,
+            pending_audio_secs: 1.5,
             ..SourcePane::default()
         };
         assert!(pane.set_usage(UsageSnapshot {
@@ -873,37 +1119,7 @@ mod tests {
 
         assert_eq!(
             pane.title(SourceKind::Microphone),
-            "microphone [listening | ctx 10]"
-        );
-    }
-
-    #[test]
-    fn preserves_prompt_context_count_when_response_only_usage_arrives() {
-        let mut pane = SourcePane {
-            status: "listening".into(),
-            ..SourcePane::default()
-        };
-
-        assert!(pane.set_usage(UsageSnapshot {
-            prompt_token_count: 653,
-            cached_content_token_count: 0,
-            response_token_count: 0,
-            tool_use_prompt_token_count: 0,
-            thoughts_token_count: 0,
-            total_token_count: 0,
-        }));
-        assert!(pane.set_usage(UsageSnapshot {
-            prompt_token_count: 0,
-            cached_content_token_count: 0,
-            response_token_count: 9,
-            tool_use_prompt_token_count: 0,
-            thoughts_token_count: 0,
-            total_token_count: 9,
-        }));
-
-        assert_eq!(
-            pane.title(SourceKind::Microphone),
-            "microphone [listening | ctx 653]"
+            "microphone [d:listening | f:ready | rms 0.012 | q 2 | 1.5s | ctx 10]"
         );
     }
 }

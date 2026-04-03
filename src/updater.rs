@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,14 +15,13 @@ pub fn run_self_update() -> Result<()> {
     let executable_dir = current_exe
         .parent()
         .ok_or_else(|| anyhow!("current executable has no parent directory"))?;
-    let stage_path = stage_path_for(&current_exe)?;
     let temp_dir = TempDir::create()?;
     let archive_path = temp_dir.join(&release.asset_name);
 
     download_release_archive(&release.download_url, &archive_path)?;
-    extract_release_archive(&archive_path, temp_dir.path())?;
+    extract_release_archive(&release, &archive_path, temp_dir.path())?;
 
-    let extracted_binary = temp_dir.join(BINARY_NAME);
+    let extracted_binary = temp_dir.join(release.binary_file_name());
     if !extracted_binary.is_file() {
         bail!(
             "release archive did not contain expected binary {}",
@@ -31,32 +29,8 @@ pub fn run_self_update() -> Result<()> {
         );
     }
 
-    if stage_path.exists() {
-        fs::remove_file(&stage_path)
-            .with_context(|| format!("remove stale stage file {}", stage_path.display()))?;
-    }
-
-    fs::copy(&extracted_binary, &stage_path).with_context(|| {
-        format!(
-            "copy extracted binary {} to staging path {}",
-            extracted_binary.display(),
-            stage_path.display()
-        )
-    })?;
-
-    let current_permissions = fs::metadata(&current_exe)
-        .with_context(|| format!("stat current executable {}", current_exe.display()))?
-        .permissions();
-    fs::set_permissions(&stage_path, current_permissions)
-        .with_context(|| format!("set permissions on {}", stage_path.display()))?;
-
-    fs::rename(&stage_path, &current_exe).with_context(|| {
-        format!(
-            "replace current executable {} from stage {}",
-            current_exe.display(),
-            stage_path.display()
-        )
-    })?;
+    self_replace::self_replace(&extracted_binary)
+        .with_context(|| format!("replace current executable {}", current_exe.display()))?;
 
     println!(
         "Updated {} in {} to {} from {}",
@@ -68,9 +42,16 @@ pub fn run_self_update() -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveKind {
+    TarGz,
+    Zip,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReleaseSpec {
     target: &'static str,
+    archive_kind: ArchiveKind,
     asset_name: String,
     download_url: String,
 }
@@ -81,43 +62,43 @@ impl ReleaseSpec {
     }
 
     fn new(os: &str, arch: &str) -> Result<Self> {
-        let target = release_target_for(os, arch)?;
-        let asset_name = release_asset_name(target);
+        let (target, archive_kind) = release_target_for(os, arch)?;
+        let asset_name = release_asset_name(target, archive_kind);
         Ok(Self {
             target,
+            archive_kind,
             download_url: release_download_url(&asset_name),
             asset_name,
         })
     }
-}
 
-fn release_target_for(os: &str, arch: &str) -> Result<&'static str> {
-    match (os, arch) {
-        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
-        ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
-        _ => bail!("self-update is only supported on macOS arm64 and x86_64"),
+    fn binary_file_name(&self) -> String {
+        match self.archive_kind {
+            ArchiveKind::TarGz => BINARY_NAME.to_string(),
+            ArchiveKind::Zip => format!("{BINARY_NAME}.exe"),
+        }
     }
 }
 
-fn release_asset_name(target: &str) -> String {
-    format!("{BINARY_NAME}-{target}.tar.gz")
+fn release_target_for(os: &str, arch: &str) -> Result<(&'static str, ArchiveKind)> {
+    match (os, arch) {
+        ("macos", "aarch64") => Ok(("aarch64-apple-darwin", ArchiveKind::TarGz)),
+        ("macos", "x86_64") => Ok(("x86_64-apple-darwin", ArchiveKind::TarGz)),
+        ("linux", "x86_64") => Ok(("x86_64-unknown-linux-gnu", ArchiveKind::TarGz)),
+        ("windows", "x86_64") => Ok(("x86_64-pc-windows-msvc", ArchiveKind::Zip)),
+        _ => bail!("self-update is unsupported for {os} {arch}"),
+    }
+}
+
+fn release_asset_name(target: &str, archive_kind: ArchiveKind) -> String {
+    match archive_kind {
+        ArchiveKind::TarGz => format!("{BINARY_NAME}-{target}.tar.gz"),
+        ArchiveKind::Zip => format!("{BINARY_NAME}-{target}.zip"),
+    }
 }
 
 fn release_download_url(asset_name: &str) -> String {
     format!("https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/latest/download/{asset_name}")
-}
-
-fn stage_path_for(current_exe: &Path) -> Result<PathBuf> {
-    let parent = current_exe
-        .parent()
-        .ok_or_else(|| anyhow!("current executable has no parent directory"))?;
-    let file_name = current_exe
-        .file_name()
-        .ok_or_else(|| anyhow!("current executable has no file name"))?;
-    let mut stage_name = OsString::from(".");
-    stage_name.push(file_name);
-    stage_name.push(".update");
-    Ok(parent.join(stage_name))
 }
 
 fn create_temp_dir() -> Result<PathBuf> {
@@ -167,31 +148,91 @@ impl Drop for TempDir {
 }
 
 fn download_release_archive(url: &str, archive_path: &Path) -> Result<()> {
-    run_command(
-        Command::new("/usr/bin/curl")
-            .arg("--fail")
-            .arg("--silent")
-            .arg("--show-error")
-            .arg("--location")
-            .arg("--proto")
-            .arg("=https")
-            .arg("--tlsv1.2")
-            .arg(url)
-            .arg("--output")
-            .arg(archive_path),
-        &format!("download release archive from {url}"),
-    )
+    #[cfg(windows)]
+    {
+        run_command(
+            powershell_command()
+                .arg("-Command")
+                .arg(
+                    "$ProgressPreference='SilentlyContinue'; \
+                     Invoke-WebRequest -Uri $env:GEMINI_UPDATE_URL -OutFile $env:GEMINI_UPDATE_OUT",
+                )
+                .env("GEMINI_UPDATE_URL", url)
+                .env("GEMINI_UPDATE_OUT", archive_path),
+            &format!("download release archive from {url}"),
+        )
+    }
+
+    #[cfg(not(windows))]
+    {
+        run_command(
+            Command::new("curl")
+                .arg("--fail")
+                .arg("--silent")
+                .arg("--show-error")
+                .arg("--location")
+                .arg("--proto")
+                .arg("=https")
+                .arg("--tlsv1.2")
+                .arg(url)
+                .arg("--output")
+                .arg(archive_path),
+            &format!("download release archive from {url}"),
+        )
+    }
 }
 
-fn extract_release_archive(archive_path: &Path, temp_dir: &Path) -> Result<()> {
+fn extract_release_archive(
+    release: &ReleaseSpec,
+    archive_path: &Path,
+    temp_dir: &Path,
+) -> Result<()> {
+    match release.archive_kind {
+        ArchiveKind::TarGz => extract_tar_gz_archive(archive_path, temp_dir),
+        ArchiveKind::Zip => extract_zip_archive(archive_path, temp_dir),
+    }
+}
+
+fn extract_tar_gz_archive(archive_path: &Path, temp_dir: &Path) -> Result<()> {
     run_command(
-        Command::new("/usr/bin/tar")
+        Command::new("tar")
             .arg("-xzf")
             .arg(archive_path)
             .arg("-C")
             .arg(temp_dir),
         &format!("extract release archive {}", archive_path.display()),
     )
+}
+
+#[cfg(windows)]
+fn extract_zip_archive(archive_path: &Path, temp_dir: &Path) -> Result<()> {
+    run_command(
+        powershell_command()
+            .arg("-Command")
+            .arg(
+                "Expand-Archive -LiteralPath $env:GEMINI_UPDATE_ARCHIVE \
+                 -DestinationPath $env:GEMINI_UPDATE_DEST -Force",
+            )
+            .env("GEMINI_UPDATE_ARCHIVE", archive_path)
+            .env("GEMINI_UPDATE_DEST", temp_dir),
+        &format!("extract release archive {}", archive_path.display()),
+    )
+}
+
+#[cfg(not(windows))]
+fn extract_zip_archive(_archive_path: &Path, _temp_dir: &Path) -> Result<()> {
+    bail!("zip extraction is only supported on Windows hosts")
+}
+
+#[cfg(windows)]
+fn powershell_command() -> Command {
+    let mut command = Command::new("powershell");
+    command
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass");
+    command
 }
 
 fn run_command(command: &mut Command, action: &str) -> Result<()> {
@@ -202,8 +243,13 @@ fn run_command(command: &mut Command, action: &str) -> Result<()> {
         return Ok(());
     }
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let detail = stderr.trim();
+    let detail = if !stderr.trim().is_empty() {
+        stderr.trim()
+    } else {
+        stdout.trim()
+    };
     if detail.is_empty() {
         bail!("{action} failed with status {}", output.status);
     }
@@ -213,60 +259,63 @@ fn run_command(command: &mut Command, action: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReleaseSpec, release_asset_name, release_download_url, release_target_for, stage_path_for,
+        ArchiveKind, ReleaseSpec, release_asset_name, release_download_url, release_target_for,
     };
 
     #[test]
     fn maps_supported_release_targets() {
         assert_eq!(
             release_target_for("macos", "aarch64").expect("arm64 target should be supported"),
-            "aarch64-apple-darwin"
+            ("aarch64-apple-darwin", ArchiveKind::TarGz)
         );
         assert_eq!(
             release_target_for("macos", "x86_64").expect("x64 target should be supported"),
-            "x86_64-apple-darwin"
+            ("x86_64-apple-darwin", ArchiveKind::TarGz)
+        );
+        assert_eq!(
+            release_target_for("linux", "x86_64").expect("linux x64 target should be supported"),
+            ("x86_64-unknown-linux-gnu", ArchiveKind::TarGz)
+        );
+        assert_eq!(
+            release_target_for("windows", "x86_64")
+                .expect("windows x64 target should be supported"),
+            ("x86_64-pc-windows-msvc", ArchiveKind::Zip)
         );
     }
 
     #[test]
     fn rejects_unsupported_release_targets() {
-        let error =
-            release_target_for("linux", "x86_64").expect_err("linux should not be supported");
-        assert!(error.to_string().contains("self-update"));
+        let error = release_target_for("linux", "aarch64")
+            .expect_err("linux arm64 should not be supported");
+        assert!(error.to_string().contains("self-update is unsupported"));
     }
 
     #[test]
-    fn builds_consistent_release_asset_name() {
+    fn builds_consistent_release_asset_names() {
         assert_eq!(
-            release_asset_name("aarch64-apple-darwin"),
+            release_asset_name("aarch64-apple-darwin", ArchiveKind::TarGz),
             "gemini-live-transcribe-aarch64-apple-darwin.tar.gz"
+        );
+        assert_eq!(
+            release_asset_name("x86_64-pc-windows-msvc", ArchiveKind::Zip),
+            "gemini-live-transcribe-x86_64-pc-windows-msvc.zip"
         );
     }
 
     #[test]
     fn builds_consistent_release_download_url() {
         assert_eq!(
-            release_download_url("gemini-live-transcribe-x86_64-apple-darwin.tar.gz"),
-            "https://github.com/JacobLinCool/gemini-live-transcribe/releases/latest/download/gemini-live-transcribe-x86_64-apple-darwin.tar.gz"
+            release_download_url("gemini-live-transcribe-x86_64-unknown-linux-gnu.tar.gz"),
+            "https://github.com/JacobLinCool/gemini-live-transcribe/releases/latest/download/gemini-live-transcribe-x86_64-unknown-linux-gnu.tar.gz"
         );
     }
 
     #[test]
-    fn stages_update_next_to_current_executable() {
-        let current_exe = std::path::Path::new("/tmp/gemini-live-transcribe");
-        assert_eq!(
-            stage_path_for(current_exe).expect("stage path should resolve"),
-            std::path::PathBuf::from("/tmp/.gemini-live-transcribe.update")
-        );
-    }
+    fn release_spec_tracks_binary_name_by_archive_kind() {
+        let mac = ReleaseSpec::new("macos", "aarch64").expect("spec should build");
+        assert_eq!(mac.binary_file_name(), "gemini-live-transcribe");
 
-    #[test]
-    fn builds_release_spec_from_host_tuple() {
-        let spec = ReleaseSpec::new("macos", "aarch64").expect("spec should build");
-        assert_eq!(spec.target, "aarch64-apple-darwin");
-        assert_eq!(
-            spec.asset_name,
-            "gemini-live-transcribe-aarch64-apple-darwin.tar.gz"
-        );
+        let windows = ReleaseSpec::new("windows", "x86_64").expect("spec should build");
+        assert_eq!(windows.binary_file_name(), "gemini-live-transcribe.exe");
     }
 }
