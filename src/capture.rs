@@ -1,11 +1,9 @@
 use std::collections::HashMap;
 #[cfg(target_os = "macos")]
 use std::ffi::c_void;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-    mpsc as std_mpsc,
-};
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
@@ -26,9 +24,7 @@ use coreaudio::audio_unit::{
     AudioUnit, Element, SampleFormat as CoreAudioSampleFormat, Scope,
     StreamFormat as CoreAudioStreamFormat,
 };
-#[cfg(target_os = "macos")]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-#[cfg(target_os = "macos")]
 use cpal::{
     FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig,
 };
@@ -80,14 +76,11 @@ pub enum SourceKind {
     #[value(alias = "mic")]
     Microphone,
     #[value(alias = "system")]
+    #[cfg_attr(not(target_os = "macos"), value(hide = true))]
     SystemAudio,
 }
 
 impl SourceKind {
-    pub const fn all() -> [Self; 2] {
-        [Self::Microphone, Self::SystemAudio]
-    }
-
     pub const fn title(self) -> &'static str {
         match self {
             Self::Microphone => "microphone",
@@ -104,6 +97,31 @@ impl SourceKind {
 }
 
 #[cfg(target_os = "macos")]
+const AVAILABLE_SOURCES: [SourceKind; 2] = [SourceKind::Microphone, SourceKind::SystemAudio];
+#[cfg(not(target_os = "macos"))]
+const AVAILABLE_SOURCES: [SourceKind; 1] = [SourceKind::Microphone];
+
+pub fn available_sources() -> &'static [SourceKind] {
+    &AVAILABLE_SOURCES
+}
+
+pub fn ensure_sources_supported(sources: &[SourceKind]) -> Result<()> {
+    for &source in sources {
+        if !available_sources().contains(&source) {
+            bail!("{}", unsupported_source_message(source));
+        }
+    }
+
+    Ok(())
+}
+
+fn unsupported_source_message(source: SourceKind) -> &'static str {
+    match source {
+        SourceKind::Microphone => "microphone capture is unavailable on this platform",
+        SourceKind::SystemAudio => "system audio capture is only supported on macOS",
+    }
+}
+
 pub fn run_capture(
     sources: Vec<SourceKind>,
     audio_routes: HashMap<SourceKind, mpsc::UnboundedSender<AudioChunk>>,
@@ -113,6 +131,7 @@ pub fn run_capture(
     if sources.is_empty() {
         return Ok(());
     }
+    ensure_sources_supported(&sources)?;
 
     let mut handles = Vec::new();
 
@@ -157,18 +176,6 @@ pub fn run_capture(
 
     Ok(())
 }
-
-#[cfg(not(target_os = "macos"))]
-pub fn run_capture(
-    _sources: Vec<SourceKind>,
-    _audio_routes: HashMap<SourceKind, mpsc::UnboundedSender<AudioChunk>>,
-    _ui_tx: std_mpsc::Sender<AppEvent>,
-    _shutdown_rx: watch::Receiver<bool>,
-) -> Result<()> {
-    bail!("this tool currently supports macOS only");
-}
-
-#[cfg(target_os = "macos")]
 fn run_microphone_capture(
     route: mpsc::UnboundedSender<AudioChunk>,
     ui_tx: std_mpsc::Sender<AppEvent>,
@@ -222,7 +229,6 @@ fn run_microphone_capture(
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 fn build_cpal_input_stream(
     source: SourceKind,
     device: &cpal::Device,
@@ -337,7 +343,6 @@ fn build_cpal_input_stream(
     }
 }
 
-#[cfg(target_os = "macos")]
 fn build_cpal_input_stream_typed<T>(
     source: SourceKind,
     device: &cpal::Device,
@@ -427,6 +432,15 @@ fn run_system_audio_capture(
     flush_batched_audio(&pipeline, &route);
 
     Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_system_audio_capture(
+    _route: mpsc::UnboundedSender<AudioChunk>,
+    _ui_tx: std_mpsc::Sender<AppEvent>,
+    _shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    bail!("{}", unsupported_source_message(SourceKind::SystemAudio))
 }
 
 #[cfg(target_os = "macos")]
@@ -765,7 +779,6 @@ fn check_core_audio_status(status: i32, context: &'static str) -> Result<()> {
     coreaudio::Error::from_os_status(status).with_context(|| context.to_string())
 }
 
-#[cfg(target_os = "macos")]
 fn flush_batched_audio<T>(batcher: &Arc<Mutex<T>>, route: &mpsc::UnboundedSender<AudioChunk>)
 where
     T: AudioBatching,
@@ -986,14 +999,12 @@ fn decode_i8_sample(bytes: &[u8], _big_endian: bool) -> f32 {
     bytes[0] as i8 as f32 / 128.0
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Debug)]
 struct AudioCapturePipeline {
     converter: AudioConverter,
     batcher: AudioChunkBatcher,
 }
 
-#[cfg(target_os = "macos")]
 impl AudioCapturePipeline {
     fn new(channels: usize, source_sample_rate: u32, target_sample_rate: u32) -> Self {
         Self {
@@ -1014,18 +1025,17 @@ impl AudioCapturePipeline {
         self.batcher.push(&converted, received_at)
     }
 
+    #[cfg(target_os = "macos")]
     fn push(&mut self, data: &[f32], received_at: Instant) -> Vec<AudioChunk> {
         let converted = self.converter.push_samples::<f32>(data);
         self.batcher.push(&converted, received_at)
     }
 }
 
-#[cfg(target_os = "macos")]
 trait AudioBatching {
     fn flush_audio(&mut self) -> Option<AudioChunk>;
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Debug)]
 struct AudioChunkBatcher {
     sample_rate: u32,
@@ -1035,7 +1045,6 @@ struct AudioChunkBatcher {
     emitted_samples: u64,
 }
 
-#[cfg(target_os = "macos")]
 impl AudioChunkBatcher {
     fn new(sample_rate: u32, duration: Duration) -> Self {
         let target_samples = ((sample_rate as u128 * duration.as_millis()) / 1000).max(1) as usize;
@@ -1104,21 +1113,18 @@ impl AudioChunkBatcher {
     }
 }
 
-#[cfg(target_os = "macos")]
 impl AudioBatching for AudioChunkBatcher {
     fn flush_audio(&mut self) -> Option<AudioChunk> {
         AudioChunkBatcher::flush_audio(self)
     }
 }
 
-#[cfg(target_os = "macos")]
 impl AudioBatching for AudioCapturePipeline {
     fn flush_audio(&mut self) -> Option<AudioChunk> {
         self.batcher.flush_audio()
     }
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Debug)]
 struct AudioConverter {
     channels: usize,
@@ -1126,7 +1132,6 @@ struct AudioConverter {
     resampler: LinearResampler,
 }
 
-#[cfg(target_os = "macos")]
 impl AudioConverter {
     fn new(channels: usize, source_sample_rate: u32, target_sample_rate: u32) -> Self {
         Self {
@@ -1165,7 +1170,6 @@ impl AudioConverter {
     }
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Debug)]
 struct LinearResampler {
     step: f64,
@@ -1173,7 +1177,6 @@ struct LinearResampler {
     buffered: Vec<f32>,
 }
 
-#[cfg(target_os = "macos")]
 impl LinearResampler {
     fn new(source_rate: u32, target_rate: u32) -> Self {
         Self {
@@ -1212,7 +1215,6 @@ impl LinearResampler {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn detect_audio_activity(samples: &[f32]) -> bool {
     if samples.is_empty() {
         return false;
@@ -1231,7 +1233,6 @@ fn detect_audio_activity(samples: &[f32]) -> bool {
     peak >= AUDIO_ACTIVITY_PEAK_THRESHOLD || rms >= AUDIO_ACTIVITY_RMS_THRESHOLD
 }
 
-#[cfg(target_os = "macos")]
 fn duration_from_samples(sample_count: u64, sample_rate: u32) -> Duration {
     if sample_count == 0 {
         return Duration::ZERO;
@@ -1241,7 +1242,7 @@ fn duration_from_samples(sample_count: u64, sample_rate: u32) -> Duration {
     Duration::from_nanos(nanos)
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
 

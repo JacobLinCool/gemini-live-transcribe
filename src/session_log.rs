@@ -30,7 +30,8 @@ struct LogWriter {
 
 impl SessionLogger {
     pub fn create(source: SourceKind, model: &str, max_files: usize) -> Result<Self> {
-        let log_dir = home_logs_dir().ok_or_else(|| anyhow!("HOME is not set"))?;
+        let log_dir =
+            home_logs_dir().ok_or_else(|| anyhow!("application log directory is unavailable"))?;
         fs::create_dir_all(&log_dir)
             .with_context(|| format!("create log directory {}", log_dir.display()))?;
 

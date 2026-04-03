@@ -1,26 +1,26 @@
 # gemini-live-transcribe
 
-Live transcription in your terminal with Gemini Live on macOS.
+Live transcription in your terminal with Gemini Live.
 
-It can capture your microphone, system audio, or both at the same time, then render each source in its own TUI pane with relative timestamps and live Gemini context usage.
+It can capture your microphone on macOS, Linux, and Windows. `system-audio` remains macOS-only and uses a Core Audio tap on the default output device.
 
 ## Highlights
 
-- Separate transcript pane per source: `microphone` and `system-audio`
+- Cross-platform `microphone` capture on macOS, Linux, and Windows
+- Separate transcript pane per source: `microphone` everywhere, `system-audio` on macOS
 - `system-audio` uses a Core Audio tap on the default output device, not screen capture
 - Relative timestamps in `HH:MM:SS |` format
 - Live Gemini context token count in each pane title
 - Session renewal with context compression and resumption enabled
-- Persistent config in `~/.gemini-live-transcribe/config.toml`
-- Per-session JSONL logs in `~/.gemini-live-transcribe/logs`
+- Persistent config in the OS-standard app config directory
+- Per-session JSONL logs in the OS-standard app data directory
 
 ## Requirements
 
-- macOS 15 or newer
-- Xcode command line tools
 - A Gemini API key
-- System Audio Recording permission if you want `system-audio`
 - Microphone permission if you want `microphone`
+- macOS 15 or newer plus Xcode command line tools if you want `system-audio`
+- System Audio Recording permission if you want `system-audio` on macOS
 
 ## Install
 
@@ -37,7 +37,8 @@ curl -fsSL https://raw.githubusercontent.com/JacobLinCool/gemini-live-transcribe
   | GEMINI_LIVE_TRANSCRIBE_INSTALL_DIR="$HOME/bin" bash
 ```
 
-The installer currently supports macOS `arm64` and `x86_64`.
+The install script supports macOS `arm64`/`x86_64` and Linux `x86_64`.
+The `update` subcommand supports macOS `arm64`/`x86_64`, Linux `x86_64`, and Windows `x86_64`.
 
 ## Quick Start
 
@@ -58,7 +59,7 @@ gemini-live-transcribe --token "$GEMINI_API_KEY"
 
 ## Common Usage
 
-Capture both microphone and system audio:
+Capture both microphone and system audio on macOS:
 
 ```bash
 gemini-live-transcribe --source microphone --source system-audio
@@ -84,25 +85,27 @@ Update an installed binary to the latest GitHub release:
 gemini-live-transcribe update
 ```
 
+On Windows, install from the published release zip first, then use `gemini-live-transcribe update` for later upgrades.
+
 ## First Run Notes
 
-The first time you capture audio, macOS may ask for permissions.
+The first time you capture audio, your OS may ask for permissions.
 
-- `system-audio` needs System Audio Recording permission for your terminal or host app
-- `microphone` needs Microphone permission
+- `microphone` needs microphone permission
+- `system-audio` needs System Audio Recording permission for your terminal or host app on macOS
 
-If permissions were denied earlier, re-enable them in macOS System Settings and restart the app.
+If permissions were denied earlier, re-enable them in your OS settings and restart the app.
 
 ## Configuration
 
-The app reads `~/.gemini-live-transcribe/config.toml` on startup.
+The app reads a per-user config file from the OS-standard app config directory on startup.
 If the file does not exist yet, it creates a default skeleton automatically.
 
 Resolution order is:
 
 1. CLI flags
 2. Environment variables where supported, currently `GEMINI_API_KEY`
-3. `~/.gemini-live-transcribe/config.toml`
+3. the generated per-user config file
 4. Interactive prompt
 
 Example config:
@@ -124,14 +127,14 @@ Notes:
 
 - `api_key` stores the Gemini API key
 - `instruction` biases transcription output; if omitted, the runtime default is `reply with less than 3 words.`
-- `sources` accepts `microphone` and `system-audio`
+- `sources` accepts `microphone` everywhere and `system-audio` on macOS
 - `[logs].max_files` must be at least `1`
 - existing config files are not overwritten
 - CLI flags override config values
 
 ## Logs
 
-Each source writes a JSONL session log under `~/.gemini-live-transcribe/logs`.
+Each source writes a JSONL session log under the OS-standard app data directory.
 
 Logs include:
 
@@ -159,3 +162,5 @@ Or pass flags directly:
 ```bash
 cargo run -- --source microphone --source system-audio
 ```
+
+On Linux and Windows, both release archives and source builds currently support `microphone`. `system-audio` is still macOS-only.

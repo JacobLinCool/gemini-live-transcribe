@@ -23,7 +23,7 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tracing_subscriber::EnvFilter;
 
-use crate::capture::{AudioChunk, SourceKind};
+use crate::capture::{AudioChunk, SourceKind, available_sources, ensure_sources_supported};
 use crate::paths::{home_config_path, home_logs_dir};
 use crate::session_log::SessionLogger;
 use crate::transcriber::{
@@ -43,7 +43,7 @@ const AUDIO_SEGMENT_SILENCE_RESET: Duration = Duration::from_millis(300);
 #[command(
     author,
     version,
-    about = "Minimal macOS TUI for Gemini Live transcription"
+    about = "Minimal terminal UI for Gemini Live transcription"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -245,7 +245,8 @@ fn resolve_launch_config(args: RunArgs) -> Result<LaunchConfig> {
     } else if let Some(config_sources) = normalize_sources_opt(file_config.sources.clone()) {
         config_sources
     } else {
-        let items = SourceKind::all()
+        let sources = available_sources();
+        let items = sources
             .iter()
             .map(|source| source.prompt_label())
             .collect::<Vec<_>>();
@@ -260,11 +261,9 @@ fn resolve_launch_config(args: RunArgs) -> Result<LaunchConfig> {
             bail!("at least one audio source must be selected");
         }
 
-        selections
-            .into_iter()
-            .map(|index| SourceKind::all()[index])
-            .collect()
+        selections.into_iter().map(|index| sources[index]).collect()
     };
+    ensure_sources_supported(&sources)?;
 
     let model = sanitize_text(model)
         .or_else(|| sanitize_text(file_config.model))
@@ -495,8 +494,10 @@ async fn run_transcriber_worker(source: SourceKind, worker: TranscriberWorkerCon
 }
 
 fn print_paths() -> Result<()> {
-    let config_path = ensure_home_config_exists()?.ok_or_else(|| anyhow!("HOME is not set"))?;
-    let logs_dir = home_logs_dir().ok_or_else(|| anyhow!("HOME is not set"))?;
+    let config_path = ensure_home_config_exists()?
+        .ok_or_else(|| anyhow!("application directories are unavailable"))?;
+    let logs_dir =
+        home_logs_dir().ok_or_else(|| anyhow!("application directories are unavailable"))?;
     println!("config_path={}", config_path.display());
     println!("logs_dir={}", logs_dir.display());
     Ok(())
@@ -886,7 +887,7 @@ mod tests {
         normalize_sources_opt, preference_summary, resolve_log_max_files, sanitize_instruction,
         sanitize_text,
     };
-    use crate::capture::{AudioChunk, SourceKind};
+    use crate::capture::{AudioChunk, SourceKind, available_sources, ensure_sources_supported};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -941,6 +942,19 @@ mod tests {
             Some(vec![SourceKind::Microphone, SourceKind::SystemAudio])
         );
         assert_eq!(normalize_sources_opt(Some(vec![])), None);
+    }
+
+    #[test]
+    fn rejects_sources_that_are_not_supported_on_this_platform() {
+        let supported = available_sources().to_vec();
+        ensure_sources_supported(&supported).expect("supported sources should validate");
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let error = ensure_sources_supported(&[SourceKind::SystemAudio])
+                .expect_err("unsupported source should be rejected");
+            assert!(error.to_string().contains("only supported on macOS"));
+        }
     }
 
     #[test]

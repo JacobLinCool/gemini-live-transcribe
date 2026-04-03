@@ -17,9 +17,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lint-and-test:
-    name: Lint and Test
-    runs-on: macos-15
+  fmt:
+    name: Format
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Check out repository
@@ -33,11 +33,38 @@ jobs:
       - name: Verify formatter
         run: cargo fmt --check
 
+      - name: Validate installer script syntax
+        run: bash -n install.sh
+
+  lint-and-test:
+    name: Lint and Test (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos
+            runner: macos-15
+          - os: linux
+            runner: ubuntu-24.04
+          - os: windows
+            runner: windows-2022
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Install Linux build dependencies
+        if: matrix.os == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+
+      - name: Install stable Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - name: Verify clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Run tests
         run: cargo test --locked
-
-      - name: Validate installer script syntax
-        run: bash -n install.sh

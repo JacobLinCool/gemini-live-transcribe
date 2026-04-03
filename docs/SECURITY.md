@@ -6,8 +6,8 @@ This repository handles live audio, transcripts, and a Gemini API key. Treat it 
 
 - Local machine and terminal host: owns permissions, config, logs, and the running binary
 - Gemini Live API: receives streamed audio and returns transcription/session events
-- Home-directory storage: `~/.gemini-live-transcribe/config.toml` and `~/.gemini-live-transcribe/logs/`
-- macOS capture frameworks: microphone input and Core Audio system-output taps controlled by OS permissions
+- OS-standard per-user storage: application config and log directories resolved per platform
+- Capture frameworks: CPAL microphone input across platforms and Core Audio system-output taps on macOS
 
 ## Sensitive Data Rules
 

@@ -11,17 +11,18 @@ The tool is intentionally small, but it still has a few hard operational invaria
 
 ## Known Failure Modes
 
-- Missing `HOME` breaks config/log path resolution.
+- Missing OS application-directory metadata breaks config/log path resolution.
 - Missing Microphone permission blocks `microphone` capture.
-- Missing System Audio Recording permission blocks `system-audio` capture.
-- Missing default output device blocks `system-audio` capture.
+- Missing System Audio Recording permission blocks `system-audio` capture on macOS.
+- Missing default output device blocks `system-audio` capture on macOS.
+- Requesting an unsupported source on the current OS must fail before capture starts.
 - Gemini Live connection failures, `goAway` renewal, and close frames can interrupt one source while others keep running.
 - Disk pressure can block build/test workflows and can also interfere with JSONL logging if the home volume is full.
 
 ## Recovery Guidance
 
 - Run `cargo run -- paths` to confirm the active config and logs locations.
-- Inspect the newest `~/.gemini-live-transcribe/logs/*.jsonl` file for the failing source before changing code.
+- Inspect the newest JSONL log under the resolved logs directory for the failing source before changing code.
 - If only one source is failing, treat that source as the fault domain first; do not assume the whole app state is corrupt.
 - When debugging timestamp or segmentation issues, inspect both the UI behavior and the corresponding session logs because the server transcript cadence and the local audio clock can diverge.
 

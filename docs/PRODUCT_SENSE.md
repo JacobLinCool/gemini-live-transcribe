@@ -4,7 +4,7 @@ This tool is built for an operator who wants live transcription with minimal set
 
 ## User Framing
 
-- Primary user: a terminal-native operator on macOS who wants live text from local audio sources
+- Primary user: a terminal-native operator on macOS, Linux, or Windows who wants live text from local audio sources
 - Primary workflow: start fast, choose sources explicitly, watch transcripts in real time, and inspect logs later if something goes wrong
 
 ## Prioritization Heuristics
@@ -20,6 +20,7 @@ This tool is built for an operator who wants live transcription with minimal set
 - Keep logs rich enough for offline debugging, but do not persist raw audio payloads.
 - Treat source isolation as a product feature, not just an implementation detail.
 - When long-running sessions require provider-specific machinery such as resumption or context compression, expose the resulting state honestly instead of pretending the connection is immortal.
+- Prefer capability-based source exposure over platform marketing. If a source is not implemented on the current OS, do not present it as available.
 
 ## What Not To Optimize For
 
